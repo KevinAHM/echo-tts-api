@@ -68,7 +68,7 @@ DEVICE = os.getenv("ECHO_DEVICE", "cuda")
 FISH_DEVICE = os.getenv("ECHO_FISH_DEVICE", DEVICE)
 MODEL_DTYPE = os.getenv("ECHO_MODEL_DTYPE", "bfloat16")  # keep half-precision by default to avoid doubling VRAM
 FISH_DTYPE = os.getenv("ECHO_FISH_DTYPE", "float32")     # keep decoder in fp32 by default for quality
-USE_COMPILE = os.getenv("ECHO_COMPILE", "0") == "1" # Takes several minutes to compile but cuts TTFB by 100~200ms
+USE_COMPILE = os.getenv("ECHO_COMPILE", "1") == "1" # Takes several minutes to compile but cuts TTFB by 100~200ms
 COMPILE_AE = os.getenv("ECHO_COMPILE_AE", "1") == "1"
 CACHE_SPEAKER_ON_GPU = os.getenv("ECHO_CACHE_SPEAKER_ON_GPU", "0") == "1" # Provides speed-up by 20ms~60ms TTFB per request at cost of VRAM usage
 CACHE_VERSION = os.getenv("ECHO_CACHE_VERSION", "v1_0")
