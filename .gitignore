@@ -8,3 +8,4 @@ venv/
 .vscode/
 api_generation.wav
 env
+*.wav

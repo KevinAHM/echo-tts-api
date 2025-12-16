@@ -6,12 +6,13 @@ Clean FastAPI application for text-to-speech with voice cloning.
 import shutil
 import subprocess
 import time
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional
 
 import torch
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import iterate_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -462,6 +463,131 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
             media_type=media_type,
             headers={"X-Audio-Sample-Rate": str(config.sample_rate)},
         )
+
+
+WS_MSG_DONE = {"done": True}
+WS_MSG_EMPTY_INPUT = {"type": "no_op", "reason": "empty_input"}
+
+
+@app.websocket("/v1/audio/speech/stream/ws")
+async def tts_stream_ws(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time TTS streaming.
+    Protocol:
+    1. Client connects.
+    2. Client sends JSON: {"input": "text", "voice": "voice_id", "segment_id": "uuid", "continue": bool, "seed": int, "extra_body": dict}
+    3. Server sends JSON: {"type": "start", "segment_id": "uuid"}
+    4. Server sends binary audio chunks (PCM16).
+    5. Server sends JSON: {"type": "end", "segment_id": "uuid"}
+    6. If "continue" is False in client msg, server closes connection after sending "done".
+    """
+    await websocket.accept()
+    if config.server.debug_logs:
+        print("[ws] WebSocket connection opened")
+    
+    try:
+        while True:
+            # Receive text message
+            try:
+                raw_data = await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+                
+            data = json.loads(raw_data)
+            
+            # Check for end of stream signal
+            if not data.get("continue", True):
+                if config.server.debug_logs:
+                    print("[ws] End of stream message received")
+                break
+            
+            input_text = data.get("input", "").strip()
+            if not input_text:
+                if config.server.debug_logs:
+                    print("[ws] Empty input received")
+                await websocket.send_json(WS_MSG_EMPTY_INPUT)
+                continue
+            
+            voice = data.get("voice", "tara")
+            segment_id = data.get("segment_id", "no_segment_id")
+            seed = int(data.get("seed", 0))
+            extra_body = data.get("extra_body", {})
+            
+            # Send start signal
+            await websocket.send_json({"type": "start", "segment_id": segment_id})
+            
+            if config.server.debug_logs:
+                print(f"[ws] Generating segment {segment_id} for input: '{input_text[:30]}...'")
+                print(f"[ws] Voice: {voice}, Seed: {seed}")
+            
+            start_time = time.perf_counter()
+            first_chunk = True
+            
+            try:
+                # Get speaker latent (should be fast if cached)
+                speaker_latent = get_speaker_manager().get_latent(voice, engine.device)
+                
+                if config.server.debug_logs:
+                    latent_mean = speaker_latent.latent.abs().mean().item()
+                    print(f"[ws] Latent loaded. Shape: {speaker_latent.latent.shape}, AbsMean: {latent_mean:.4f}")
+
+                # Configure generation
+                gen_config = _parse_generation_config(extra_body, streaming=True)
+                
+                # Generate and stream
+                # Note: We rely on engine.generate_streaming returning an iterator of bytes
+                chunk_idx = 0
+                total_bytes_sent = 0
+                for chunk in engine.generate_streaming(
+                    text=input_text,
+                    speaker_latent=speaker_latent.latent,
+                    speaker_mask=speaker_latent.mask,
+                    gen_config=gen_config,
+                    rng_seed=seed,
+                ):
+                    if first_chunk:
+                        ttfb = time.perf_counter() - start_time
+                        if config.server.debug_logs:
+                            print(f"[ws] TTFB: {ttfb*1000:.2f} ms")
+                        first_chunk = False
+                    
+                    if config.server.debug_logs:
+                        print(f"[ws] Chunk {chunk_idx}: {len(chunk)} bytes. Start: {chunk[:4].hex()} End: {chunk[-4:].hex()}")
+                    
+                    await websocket.send_bytes(chunk)
+                    chunk_idx += 1
+                    total_bytes_sent += len(chunk)
+                
+                if config.server.debug_logs:
+                    print(f"[ws] Total bytes sent: {total_bytes_sent}")
+                
+                # Send end signal
+                await websocket.send_json({"type": "end", "segment_id": segment_id})
+                
+                # Check if client wanted to close after this
+                if not data.get("continue", True):
+                    await websocket.send_json(WS_MSG_DONE)
+                    break
+
+            except Exception as e:
+                print(f"[ws] Error generating segment {segment_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                await websocket.send_json({"error": str(e), "done": True, "segment_id": segment_id})
+                break
+                
+    except WebSocketDisconnect:
+        if config.server.debug_logs:
+            print("[ws] Client disconnected")
+    except Exception as e:
+        print(f"[ws] Unexpected error: {e}")
+    finally:
+        if config.server.debug_logs:
+            print("[ws] Closing WebSocket")
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass # Already closed
 
 
 if __name__ == "__main__":
