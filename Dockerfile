@@ -7,9 +7,10 @@ ENV PYTHONUNBUFFERED=1 \
     ECHO_HOST=0.0.0.0 \
     PORT=8000
 
-# Install system dependencies (ffmpeg is required for mp3/wav handling)
+# Install system dependencies (ffmpeg is required for mp3/wav handling, build-essential for torch.compile)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
