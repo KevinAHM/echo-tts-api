@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Test script for Echo TTS API that measures TTFB and saves streaming audio chunks.
-"""
-
 import time
 import requests
 import sys
@@ -161,16 +156,21 @@ def test_tts_api(
 
 if __name__ == "__main__":
     # Configuration variables
-    URL = "http://localhost:8000/v1/audio/speech"
+    URL = "http://localhost:8001/v1/audio/speech"
     # INPUT_TEXT = "Wow, this place looks even better than I imagined. How did they set all this up so perfectly? The lights, the music, everything feels magical. I can't stop smiling right now.”"
     # INPUT_TEXT = "Hey What's up? How are you doing today? So happy to see you again!"
-    INPUT_TEXT = "Hey, how are you doing today (whsiper) ? Hey, I'm building a voice agent and I'm facing some issues with the latency (coughs) . I don't know how can I get it some ideas to fix it."
+    INPUT_TEXT = "Hello! This is a test of the Echo TTS streaming WebSocket. How does it sound?"
     # VOICE = "expresso_02_ex03-ex01_calm_005"
-    VOICE = "maya_ref"
+    VOICE = "maya_long_ref"
     STREAM = True
     SEED = 0
-    OUTPUT_FILE = "test_output2.wav"
-    EXTRA_BODY = {}
+    OUTPUT_FILE = "test_output_http.wav"
+    EXTRA_BODY = {
+        "chunking_enabled": False,
+        "speaker_kv_scale": 1.2,
+        "speaker_kv_min_t": 0.9,
+        "speaker_kv_max_layers": 24
+    }
     
     result = test_tts_api(
         url=URL,

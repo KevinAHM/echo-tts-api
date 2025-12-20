@@ -58,7 +58,7 @@ DEFAULT_ZERO_TAIL_FRAMES = 16
 DEFAULT_ZERO_TAIL_MIN_FRAC = 0.95
 DEFAULT_BLOCK_SIZE_NONSTREAM = 640
 DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
-DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"
+DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "1") == "1"
 FFMPEG_PATH = shutil.which("ffmpeg")
 
 MODEL_REPO = os.getenv("ECHO_MODEL_REPO", "jordand/echo-tts-base") # Model repo overriden when using LoRA
@@ -70,13 +70,13 @@ MODEL_DTYPE = os.getenv("ECHO_MODEL_DTYPE", "bfloat16")  # keep half-precision b
 FISH_DTYPE = os.getenv("ECHO_FISH_DTYPE", "float32")     # keep decoder in fp32 by default for quality
 USE_COMPILE = os.getenv("ECHO_COMPILE", "1") == "1" # Takes several minutes to compile but cuts TTFB by 100~200ms
 COMPILE_AE = os.getenv("ECHO_COMPILE_AE", "1") == "1"
-CACHE_SPEAKER_ON_GPU = os.getenv("ECHO_CACHE_SPEAKER_ON_GPU", "0") == "1" # Provides speed-up by 20ms~60ms TTFB per request at cost of VRAM usage
+CACHE_SPEAKER_ON_GPU = os.getenv("ECHO_CACHE_SPEAKER_ON_GPU", "1") == "1" # Provides speed-up by 20ms~60ms TTFB per request at cost of VRAM usage
 CACHE_VERSION = os.getenv("ECHO_CACHE_VERSION", "v1_0")
 CACHE_DIR = Path(os.getenv("ECHO_CACHE_DIR", "/tmp"))
-WARMUP_VOICE = os.getenv("ECHO_WARMUP_VOICE")
+WARMUP_VOICE = os.getenv("ECHO_WARMUP_VOICE", "maya_long_ref")
 WARMUP_TEXT = os.getenv("ECHO_WARMUP_TEXT", "[S1] Warmup compile run.")
 # Chunking config (wiring TBD; previewed in scripts/chunk_preview.py)
-CHUNKING_ENABLED = os.getenv("ECHO_CHUNKING", "1") == "1"
+CHUNKING_ENABLED = os.getenv("ECHO_CHUNKING", "0") == "1"
 CHUNK_CHARS_PER_SECOND = float(os.getenv("ECHO_CHUNK_CHARS_PER_SECOND", "14"))
 CHUNK_WORDS_PER_SECOND = float(os.getenv("ECHO_CHUNK_WORDS_PER_SECOND", "2.7"))
 NORMALIZE_EXCLAMATION = os.getenv("ECHO_NORMALIZE_EXCLAMATION", "1") == "1"
@@ -1803,4 +1803,4 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api_server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+    uvicorn.run("api_server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8001")), reload=False)

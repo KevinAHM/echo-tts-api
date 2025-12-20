@@ -6,8 +6,68 @@ import wave
 import struct
 
 SERVER_URL = "ws://localhost:8000/v1/audio/speech/stream/ws"
-OUTPUT_FILE = "output.wav"
+OUTPUT_FILE = "test_output_ws.wav"
 SAMPLE_RATE = 44100  # Match Server Config
+# voice = "maya_long_ref"
+voice = "maya_ref"
+# voice = "expresso_02_ex03-ex01_calm_005"
+# voice = "maya_voices"
+
+# Test cases for conversational voice assistant - uncomment one to test:
+
+
+# text = "(singing) Happy birthday to you. Hope you have an amazing day today?"
+# text = "(singing) Happy birthday to you."
+# text = "(singing) Hope you have an amazing day today."
+
+# text = "Hello (laughs) This is a test of the Echo TTS streaming WebSocket. How does it sound?"
+# text = "That's hilarious! (laughs) I can't believe that actually happened to you."
+# text = "I'm so happy for you! (laughs) That's the best news I've heard all week."
+
+# text = "(whispers) Hey, I think someone's at the door."
+# text = "(whispers) Should I check who it is?"
+
+# text = "(sighs) I've been trying to solve this problem all day."
+# text = "(sighs) I tried so hard to prevent it."
+# text = "(sighs) Everything feels different now."
+
+# text = "(sobbing) I just can't handle this anymore."
+# text = "(sobbing) Everything is falling apart."
+# text = "(sobbing) Why did this have to happen?"
+
+# text = "Wait, what (gasps) ? I had no idea that was even possible!"
+# text = "(gasps) Oh my goodness! I wasn't expecting that at all."
+
+# text = "(yawns) Sorry, I'm a bit tired."
+# text = "(yawns) What were you saying about the meeting?"
+
+# text = "Excuse me (coughs) Now, where were we in our conversation?"
+# text = "I'm not feeling well today (coughs) ."
+
+# text = "(sad) Is there anything I can do to help?"
+# text = "(surprised) Really? That's not what I thought would happen."
+# text = "(frustrated) This isn't working no matter what I try. I don't understand why."
+# text = "(angry) I can't believe you did that! This is completely unacceptable."
+# text = "(shouts) Watch out! Get out of the way right now!"
+# text = "No way! (disgusted) I'm not going anywhere near that mess."
+# text = "(excited) Wow, that's incredible! You really did an amazing job on this project."
+# text = "(cheerful) The weather looks perfect today. Maybe we should go for a walk in the park?"
+
+
+
+seed = 101  # Random seed for reproducibility
+# Advanced sampler configuration (optional)
+extra_body = {
+    "chunking_enabled": False,
+    # "speaker_kv_scale": 1.33,
+    # "speaker_kv_min_t": 0.9,
+    # "speaker_kv_max_layers": 24,
+    # Uncomment to customize sampler settings:
+    # "block_sizes": [32, 128, 480],
+    # "num_steps": [8, 15, 20],
+    # "cfg_scale_text": 3.0,
+    # "cfg_scale_speaker": 8.0,
+}
 
 async def test_echo_ws():
     print(f"Connecting to {SERVER_URL}...")
@@ -18,14 +78,15 @@ async def test_echo_ws():
                 print("Connected!")
                 
                 # Prepare a request
-                text = "Hello! This is a test of the Echo TTS streaming WebSocket. How does it sound?"
-                voice = "tara"
+               
                 segment_id = "test_seg_1"
                 
                 request = {
                     "input": text,
-                    "voice": "maya_ref",
+                    "voice": voice,
                     "segment_id": segment_id,
+                    "seed": seed,
+                    "extra_body": extra_body,
                     "continue": True
                 }
                 
