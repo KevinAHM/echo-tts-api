@@ -1,8 +1,3 @@
-"""
-Echo TTS API Server.
-Clean FastAPI application for text-to-speech with voice cloning.
-"""
-
 import shutil
 import subprocess
 import time

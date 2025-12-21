@@ -155,7 +155,7 @@ class VoiceConfig:
 class WarmupConfig:
     """Warmup configuration."""
     
-    warmup_voice: Optional[str] = os.getenv("ECHO_WARMUP_VOICE")
+    warmup_voice: str = os.getenv("ECHO_WARMUP_VOICE", "maya_ref")
     warmup_text: str = os.getenv("ECHO_WARMUP_TEXT", "[S1] Warmup compile run.")
 
 
