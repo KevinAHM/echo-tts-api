@@ -67,13 +67,14 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 - Chunking/text defaults: `ECHO_CHUNKING` (default `1`), `ECHO_CHUNK_CHARS_PER_SECOND` (default `14`), `ECHO_CHUNK_WORDS_PER_SECOND` (default `2.7`), `ECHO_NORMALIZE_EXCLAMATION` (default `1`) normalizes `!` (single -> `.`, multiple -> `!`).
 - Reference audio handling: `ECHO_MAX_SPEAKER_LATENT_LENGTH` (default `6400`), `ECHO_FOLDER_SUPPORT` (default `1` to allow folder prompts), `ECHO_WARMUP_VOICE` and `ECHO_WARMUP_TEXT` seed optional compile warmup.
 - Optional dependency: ffmpeg (on PATH) is required for `response_format='mp3'`; when present, non-stream defaults to MP3, otherwise WAV.
-- Performance presets (streaming only): `ECHO_PERFORMANCE_PRESET` (default `default`) sets streaming sampler defaults: `default` uses `block_sizes=[32, 128, 480]` / `num_steps=[8, 15, 20]`; `low_mid` keeps those blocks with `num_steps=[8, 10, 15]`; `low` uses `block_sizes=[32, 64, 272, 272]` and `num_steps=[8, 10, 15, 15]`. Unknown values fall back to default with a warning; non-streaming uses its own steps.
+- Performance presets (streaming only): `ECHO_PERFORMANCE_PRESET` (default `default`) sets streaming sampler defaults: `default` uses `block_sizes=[32, 128, 480]` / `num_steps=[8, 15, 20]`; `low_mid` keeps those blocks with `num_steps=[8, 10, 15]`; `low` uses `block_sizes=[32, 64, 272, 272]` and `num_steps=[8, 10, 15, 15]`; `equal` uses `block_sizes=[213, 213, 214]` and `num_steps=[15, 15, 15]` for three ~10s blocks with uniform quality. Unknown values fall back to default with a warning; non-streaming uses its own steps.
 - Non-streaming steps: `ECHO_NUM_STEPS_NONSTREAM` (default `20`) controls the fixed non-stream sampler steps (recommended range 10–40); block size stays `640` by default unless overridden via request.
 - Note: enabling `torch.compile` (model and/or decoder) can increase peak VRAM; disable `ECHO_COMPILE`/`ECHO_COMPILE_AE` if memory is tight.
 
 ### Performance / VRAM notes
 - Quick presets (streaming): set `ECHO_PERFORMANCE_PRESET=low_mid` to reduce steps or `ECHO_PERFORMANCE_PRESET=low` to also shrink blocks; both lower compute/VRAM at some quality cost. Non-streaming always defaults to 20 steps unless you set `ECHO_NUM_STEPS_NONSTREAM` (10–40 recommended).
 - Lower-end GPUs: prefer `ECHO_PERFORMANCE_PRESET=low_mid` (fewer streaming steps) or `ECHO_PERFORMANCE_PRESET=low` (smaller blocks + fewer steps) instead of manual step tweaks.
+- Uniform streaming quality: `ECHO_PERFORMANCE_PRESET=equal` splits generation into three ~10s blocks with 15 steps each, trading faster TTFB for consistent quality across all chunks (no small fast first block).
 - Compile vs presets: with `ECHO_COMPILE=1` you may be able to keep the higher (default) preset while staying real-time, but it raises peak VRAM; if memory is tight, turn compile off before lowering presets.
 - VRAM reduction: set `ECHO_FISH_DTYPE=bfloat16` (or `bf16`) to run the decoder in bf16 at a small quality cost.
 - Disable compile to save memory: set `ECHO_COMPILE=0` (model) and `ECHO_COMPILE_AE=0` (Fish AE, which defaults to compiled) if VRAM is constrained; expect slower generations.
