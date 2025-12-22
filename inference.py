@@ -338,8 +338,11 @@ def find_flattening_point(data, target_value=0.0, window_size=20, std_threshold=
     max_abs_threshold = 0.05
     min_runs = 2  # require this many consecutive flat windows
 
+    data = torch.cat([data, data.new_zeros((window_size,) + data.shape[1:])], dim=0)
+
     flat_start = len(data)
     runs = 0
+
     for i in range(len(data) - window_size, -1, -1):
         window = data[i : i + window_size]
         std_ok = window.std() < std_threshold

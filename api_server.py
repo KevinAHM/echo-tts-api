@@ -89,6 +89,7 @@ _PERFORMANCE_PRESETS = {
     "default": {"block_sizes": [32, 128, 480], "num_steps": [8, 15, 20]},
     "low_mid": {"block_sizes": [32, 128, 480], "num_steps": [8, 10, 15]},
     "low": {"block_sizes": [32, 64, 272, 272], "num_steps": [8, 10, 15, 15]},
+    "equal": {"block_sizes": [213, 213, 214], "num_steps": [15, 15, 15]},  # 3x ~10s blocks
 }
 if PERFORMANCE_PRESET in _PERFORMANCE_PRESETS:
     preset = _PERFORMANCE_PRESETS[PERFORMANCE_PRESET]
@@ -344,6 +345,10 @@ def _find_voice_file(name: str) -> Optional[Path]:
     if not sanitized:
         return None
 
+    # Bail out early for strings too long to be filenames (likely base64 audio)
+    if len(sanitized) > 255:
+        return None
+
     roots = _voice_roots()
     name_path = Path(sanitized)
 
@@ -452,7 +457,8 @@ def _decode_base64_audio(encoded: str) -> Tuple[torch.Tensor, str]:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid base64 voice: {exc}") from exc
 
-    cache_key = f"base64:{sha256(raw).hexdigest()}"
+    # Hash the encoded string (not decoded bytes) for consistent cache keys
+    cache_key = f"base64:{sha256(encoded.encode()).hexdigest()}"
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(raw)
@@ -595,7 +601,8 @@ def _get_speaker_latent(voice: str) -> Tuple[torch.Tensor, torch.Tensor]:
     # Check if voice is a directory
     local_path = _find_voice_file(voice)
     is_directory = local_path is not None and local_path.is_dir()
-    _log_debug(f"[voice] lookup voice={voice} path={local_path} is_dir={is_directory}")
+    voice_display = voice[:50] + "..." if len(voice) > 50 else voice
+    _log_debug(f"[voice] lookup voice={voice_display} path={local_path} is_dir={is_directory}")
     if not is_directory and local_path is not None:
         cache_key = f"file:{local_path.resolve()}"
         if cache_key in _SPEAKER_CACHE:
@@ -658,6 +665,30 @@ def _get_speaker_latent(voice: str) -> Tuple[torch.Tensor, torch.Tensor]:
         return _SPEAKER_CACHE[cache_key][0].to(model.device), _SPEAKER_CACHE[cache_key][1].to(model.device)
     
     # Handle single file case (existing logic)
+    # For base64, check cache using hash of the encoded string before decoding
+    # This avoids expensive decode + file I/O on cache hits
+    is_base64 = local_path is None
+    if is_base64:
+        # Strip data URL prefix if present for consistent hashing
+        encoded_for_hash = voice.split(",", 1)[1] if "," in voice else voice
+        cache_key = f"base64:{sha256(encoded_for_hash.encode()).hexdigest()}"
+        if cache_key in _SPEAKER_CACHE:
+            _log_debug(f"[voice] cache hit {cache_key} (base64 pre-decode) {(time.time() - t_start)*1000:.2f} ms")
+            cached_latent, cached_mask = _SPEAKER_CACHE[cache_key]
+            gpu_hit = (
+                _SPEAKER_CACHE_GPU.get(cache_key, {}).get(target_device_key)
+                if CACHE_SPEAKER_ON_GPU
+                else None
+            )
+            if gpu_hit:
+                _log_debug(f"[voice] gpu cache hit {cache_key} dev={target_device_key} {(time.time() - t_start)*1000:.2f} ms")
+                return gpu_hit[0], gpu_hit[1]
+            result = cached_latent.to(target_device), cached_mask.to(target_device)
+            if CACHE_SPEAKER_ON_GPU:
+                _SPEAKER_CACHE_GPU.setdefault(cache_key, {})[target_device_key] = result
+                _log_debug(f"[voice] gpu cache store {cache_key} dev={target_device_key} {(time.time() - t_start)*1000:.2f} ms")
+            return result
+
     load_start = time.time()
     audio, cache_key = _resolve_voice(voice)
     _log_debug(f"[voice] load_audio {cache_key} {(time.time() - load_start)*1000:.2f} ms")
@@ -1484,7 +1515,7 @@ def _stream_blocks(
         flatten_point = None
         if will_finish:
             prefix_latent_trim = prefix_latent[:, :pos_id]
-            flatten_point = find_flattening_point(prefix_latent_trim[0], window_size=32, std_threshold=0.02)
+            flatten_point = find_flattening_point(prefix_latent_trim[0])
             already_emitted_latents = streaming_decoder._emitted_samples // streaming_decoder.samples_per_latent
             flatten_point = max(flatten_point, already_emitted_latents)
 
@@ -1625,6 +1656,9 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
     else:
         chunks = [payload.input]
     _log_debug(f"[route] chunking_enabled={chunking_enabled} chunks={len(chunks)}")
+    for i, chunk in enumerate(chunks):
+        chunk_preview = chunk[:100] + "..." if len(chunk) > 100 else chunk
+        _log_debug(f"[route] chunk {i+1}/{len(chunks)}: {chunk_preview!r}")
 
     if not payload.stream:
         if "block_sizes" not in payload.extra_body:
