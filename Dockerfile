@@ -5,9 +5,14 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ECHO_HOST=0.0.0.0 \
-    PORT=8000
+    PORT=8000 \
+    # Cache directories (mount /cache as a volume to persist across container restarts):
+    HF_HOME=/cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/cache/huggingface/hub \
+    TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor \
+    TRITON_CACHE_DIR=/cache/triton \
+    ECHO_CACHE_DIR=/cache/echo
 
-# Install system dependencies (ffmpeg is required for mp3/wav handling, build-essential for torch.compile)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     build-essential \

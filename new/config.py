@@ -59,6 +59,8 @@ class ModelConfig:
     
     # Speaker latent settings
     max_speaker_latent_length: int = int(os.getenv("ECHO_MAX_SPEAKER_LATENT_LENGTH", "6400"))
+    speaker_latent_buckets: str = os.getenv("ECHO_SPEAKER_LATENT_BUCKETS", "128,256,512,1024,2048")
+    warmup_speaker_buckets: str = os.getenv("ECHO_WARMUP_SPEAKER_BUCKETS", "128,256,512,1024,2048")
     
     @property
     def model_dtype(self) -> torch.dtype | None:
@@ -165,7 +167,7 @@ class ServerConfig:
     
     host: str = os.getenv("ECHO_HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))
-    debug_logs: bool = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"
+    debug_logs: bool = os.getenv("ECHO_DEBUG_LOGS", "1") == "1"
 
 
 @dataclass

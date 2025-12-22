@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import time
 import json
+import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional
@@ -219,14 +220,53 @@ def _run_warmup() -> None:
         gen_config.early_stop_on_zero = False  # Don't early stop during warmup
         
         print(f"  Running warmup with voice '{warmup_voice}'...")
-        for _ in engine.generate_streaming(
-            text=config.warmup.warmup_text,
-            speaker_latent=speaker_latent.latent,
-            speaker_mask=speaker_latent.mask,
-            gen_config=gen_config,
-            rng_seed=0,
-        ):
-            pass
+        warmup_start = time.time()
+        raw_buckets = config.model.warmup_speaker_buckets.strip()
+        if raw_buckets:
+            buckets: List[int] = []
+            for part in raw_buckets.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    buckets.append(int(part))
+                except ValueError:
+                    continue
+            buckets = sorted(set(b for b in buckets if b > 0))
+        else:
+            buckets = [int(speaker_latent.latent.shape[1])]
+
+        # Ensure the warmup bucket is included
+        if int(speaker_latent.latent.shape[1]) not in buckets:
+            buckets.append(int(speaker_latent.latent.shape[1]))
+            buckets = sorted(set(buckets))
+
+        import torch.nn.functional as F
+
+        for b in buckets:
+            # Build a latent/mask with stable shape (pad or truncate).
+            lat = speaker_latent.latent
+            msk = speaker_latent.mask
+            cur = int(lat.shape[1])
+            if b < cur:
+                lat_b = lat[:, :b]
+                msk_b = msk[:, :b]
+            elif b > cur:
+                pad = b - cur
+                lat_b = F.pad(lat, (0, 0, 0, pad))
+                msk_b = F.pad(msk, (0, pad))
+            else:
+                lat_b, msk_b = lat, msk
+
+            print(f"Warmup compile for speaker bucket={b} (cur={cur})")
+            for _ in engine.generate_streaming(
+                text=config.warmup.warmup_text,
+                speaker_latent=lat_b,
+                speaker_mask=msk_b,
+                gen_config=gen_config,
+                rng_seed=0,
+            ):
+                pass
         
         # Also warmup non-streaming config
         gen_config_nonstream = GenerationConfig.for_non_streaming()
