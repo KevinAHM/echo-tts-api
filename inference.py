@@ -326,17 +326,21 @@ def get_speaker_latent_and_mask(
 
 # ________
 
-def find_flattening_point(data, target_value=0.0, window_size=20, std_threshold=0.05):
+def find_flattening_point(
+    data,
+    target_value=0.0,
+    window_size=20,
+    std_threshold=0.1,
+    mean_abs_threshold=0.02,
+    max_abs_threshold=0.05,
+    min_runs=2,
+):
     """
     Heuristic to find the start of the flat (near-zero) tail of the latent sequence.
     Scans backward from the end, requiring consecutive flat windows.
     """
     if data.numel() == 0:
         return 0
-
-    mean_abs_threshold = 0.02
-    max_abs_threshold = 0.05
-    min_runs = 2  # require this many consecutive flat windows
 
     data = torch.cat([data, data.new_zeros((window_size,) + data.shape[1:])], dim=0)
 

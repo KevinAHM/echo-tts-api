@@ -2,6 +2,7 @@ import base64
 import gzip
 import math
 import os
+import random
 import tempfile
 import io
 import wave
@@ -53,9 +54,10 @@ DEFAULT_CFG_SPEAKER = 8.0
 DEFAULT_CFG_MIN_T = 0.5
 DEFAULT_CFG_MAX_T = 1.0
 DEFAULT_EARLY_STOP = True
-DEFAULT_ZERO_EPS = 2.0e-2  # even looser to trigger early_stop on low-energy tails
+DEFAULT_ZERO_EPS = 2.0e-2  # threshold for counting values as "near zero"
 DEFAULT_ZERO_TAIL_FRAMES = 16
-DEFAULT_ZERO_TAIL_MIN_FRAC = 0.95
+DEFAULT_ZERO_TAIL_MIN_FRAC = 0.90  # lowered from 0.95 to allow some outliers
+DEFAULT_ZERO_TAIL_ABSMAX = 1.0  # separate absmax threshold (permissive to allow spikes)
 DEFAULT_BLOCK_SIZE_NONSTREAM = 640
 DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
 DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"
@@ -82,6 +84,10 @@ CHUNK_WORDS_PER_SECOND = float(os.getenv("ECHO_CHUNK_WORDS_PER_SECOND", "2.7"))
 NORMALIZE_EXCLAMATION = os.getenv("ECHO_NORMALIZE_EXCLAMATION", "1") == "1"
 MAX_SPEAKER_LATENT_LENGTH = int(os.getenv("ECHO_MAX_SPEAKER_LATENT_LENGTH", "6400"))
 FOLDER_SUPPORT = os.getenv("ECHO_FOLDER_SUPPORT", "1") == "1"
+# VAD reroll settings
+VAD_REROLL_ENABLED = os.getenv("ECHO_VAD_REROLL_ENABLED", "0") == "1"
+VAD_MAX_REROLLS = int(os.getenv("ECHO_VAD_MAX_REROLLS", "3"))
+VAD_SILENCE_THRESHOLD_MS = int(os.getenv("ECHO_VAD_SILENCE_THRESHOLD_MS", "1000"))
 # Performance presets
 _PERFORMANCE_PRESET_RAW = os.getenv("ECHO_PERFORMANCE_PRESET", "default")
 PERFORMANCE_PRESET = _PERFORMANCE_PRESET_RAW.strip().lower().replace("-", "_")
@@ -139,6 +145,8 @@ _LOADED_CACHE_PATHS: set[Path] = set()
 _SAVED_CACHE_PATHS: set[Path] = set()
 _WARMUP_RAN = False
 _COMPILE_DISABLED = False
+_VAD_MODEL = None
+_VAD_UTILS = None
 
 
 def _log_debug(msg: str) -> None:
@@ -228,6 +236,114 @@ def _disable_compile(reason: str) -> None:
         return
     _COMPILE_DISABLED = True
     print(f"⚠️ Disabling torch.compile for this process due to error: {reason}")
+
+
+def _load_vad_model() -> Tuple[Any, Any]:
+    """Load Silero VAD model. Called at startup if VAD reroll is enabled."""
+    global _VAD_MODEL, _VAD_UTILS
+    if _VAD_MODEL is not None:
+        return _VAD_MODEL, _VAD_UTILS
+
+    # Set torch hub cache to match HF cache for unified storage
+    torch.hub.set_dir(os.path.expanduser("~/.cache/huggingface/hub"))
+
+    print("[vad] Loading Silero VAD model...")
+    model, utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        trust_repo=True,
+    )
+    model = model.to(DEVICE)
+    _VAD_MODEL = model
+    _VAD_UTILS = utils
+    print(f"[vad] Loaded Silero VAD model on {DEVICE}")
+    return _VAD_MODEL, _VAD_UTILS
+
+
+def _check_silence_vad(audio: torch.Tensor, threshold_ms: int = 1000) -> Tuple[bool, float]:
+    """
+    Check if audio contains silence >= threshold_ms using VAD.
+
+    Args:
+        audio: Audio tensor at 44.1kHz, shape (samples,) or (1, samples) or (1, 1, samples)
+        threshold_ms: Silence threshold in milliseconds
+
+    Returns:
+        (has_long_silence, max_silence_ms): Whether silence >= threshold exists, and max silence duration
+    """
+    if not VAD_REROLL_ENABLED or _VAD_MODEL is None:
+        return False, 0.0
+
+    # Squeeze to 1D
+    original_shape = audio.shape
+    audio = audio.detach().float().cpu().squeeze()
+    audio_duration_sec = audio.numel() / SAMPLE_RATE
+    audio_duration_ms = audio_duration_sec * 1000.0
+
+    _log_debug(f"[vad] Input: shape={original_shape} -> squeezed={audio.shape}, samples={audio.numel()}, duration={audio_duration_ms:.1f}ms")
+
+    if audio.numel() == 0:
+        _log_debug(f"[vad] Empty audio, skipping VAD check")
+        return False, 0.0
+
+    # Resample 44.1kHz -> 16kHz for VAD
+    audio_16k = torchaudio.functional.resample(
+        audio.unsqueeze(0),
+        orig_freq=SAMPLE_RATE,
+        new_freq=16000,
+    ).squeeze()
+
+    # Reset VAD model state before processing new audio
+    _VAD_MODEL.reset_states()
+
+    # Get speech timestamps
+    get_speech_timestamps = _VAD_UTILS[0]
+    speech_timestamps = get_speech_timestamps(
+        audio_16k.to(DEVICE),
+        _VAD_MODEL,
+        sampling_rate=16000,
+        return_seconds=True,
+    )
+
+    threshold_sec = threshold_ms / 1000.0
+
+    _log_debug(f"[vad] Speech segments: {speech_timestamps}")
+
+    # Find max silence gap
+    max_silence_sec = 0.0
+    silence_source = "none"
+
+    if not speech_timestamps:
+        # No speech detected - entire audio is silence
+        max_silence_sec = audio_duration_sec
+        silence_source = "no_speech_detected"
+    else:
+        # Check leading silence
+        first_speech_start = speech_timestamps[0]["start"]
+        if first_speech_start > max_silence_sec:
+            max_silence_sec = first_speech_start
+            silence_source = "leading"
+
+        # Check gaps between speech segments
+        for i in range(len(speech_timestamps) - 1):
+            gap = speech_timestamps[i + 1]["start"] - speech_timestamps[i]["end"]
+            if gap > max_silence_sec:
+                max_silence_sec = gap
+                silence_source = f"gap_{i}"
+
+        # Check trailing silence
+        last_speech_end = speech_timestamps[-1]["end"]
+        trailing_silence = audio_duration_sec - last_speech_end
+        if trailing_silence > max_silence_sec:
+            max_silence_sec = trailing_silence
+            silence_source = "trailing"
+
+    max_silence_ms = max_silence_sec * 1000
+    has_long_silence = max_silence_sec >= threshold_sec
+
+    _log_debug(f"[vad] Result: max_silence={max_silence_ms:.1f}ms ({silence_source}), threshold={threshold_ms}ms, has_long_silence={has_long_silence}")
+
+    return has_long_silence, max_silence_ms
 
 
 def _ensure_cache_aliases(model: torch.nn.Module) -> None:
@@ -793,6 +909,7 @@ class SamplerConfig:
     zero_eps: float
     zero_tail_min_frac: float
     zero_tail_frames: int
+    zero_tail_absmax: float
     guidance_mode: GuidanceMode
     max_text_length: int
 
@@ -848,6 +965,7 @@ def _parse_sampler_config(extra_body: Dict[str, Any]) -> SamplerConfig:
         extra_body.get("zero_tail_min_frac", DEFAULT_ZERO_TAIL_MIN_FRAC)
     )
     zero_tail_frames = int(extra_body.get("zero_tail_frames", DEFAULT_ZERO_TAIL_FRAMES))
+    zero_tail_absmax = float(extra_body.get("zero_tail_absmax", DEFAULT_ZERO_TAIL_ABSMAX))
     early_stop_on_zero = bool(extra_body.get("early_stop_on_zero", DEFAULT_EARLY_STOP))
     max_text_length = int(extra_body.get("max_text_length", 768))
 
@@ -886,6 +1004,7 @@ def _parse_sampler_config(extra_body: Dict[str, Any]) -> SamplerConfig:
         zero_eps=zero_eps,
         zero_tail_min_frac=zero_tail_min_frac,
         zero_tail_frames=zero_tail_frames,
+        zero_tail_absmax=zero_tail_absmax,
         guidance_mode=guidance_mode,
         max_text_length=max_text_length,
     )
@@ -1052,6 +1171,20 @@ class StreamingAEDecoder:
             self._emitted_samples = total_samples_global
         return new_audio
 
+    def get_state(self) -> Dict[str, Any]:
+        """Save decoder state for potential reroll."""
+        return {
+            "tail_latents": self._tail_latents.clone() if self._tail_latents is not None else None,
+            "emitted_samples": self._emitted_samples,
+            "total_latents_seen": self._total_latents_seen,
+        }
+
+    def set_state(self, state: Dict[str, Any]) -> None:
+        """Restore decoder state for reroll."""
+        self._tail_latents = state["tail_latents"].clone() if state["tail_latents"] is not None else None
+        self._emitted_samples = state["emitted_samples"]
+        self._total_latents_seen = state["total_latents_seen"]
+
     def is_finished(self, flattening_point: int | None) -> bool:
         if flattening_point is None:
             return False
@@ -1097,17 +1230,52 @@ def _generate_full_audio_bytes(
         zero_tail_frames=cfg.zero_tail_frames,
     )
 
-    latent_out = sample_fn(
-        model,
-        speaker_latent,
-        speaker_mask,
-        text_input_ids,
-        text_mask,
-        rng_seed,
-    )
+    max_attempts = VAD_MAX_REROLLS + 1 if VAD_REROLL_ENABLED else 1
+    best_pcm: Optional[bytes] = None
+    best_silence_ms = float("inf")
 
-    audio_out = _ae_decode_with_flatten(fish_ae, pca_state, latent_out)
-    pcm = _audio_to_pcm(audio_out)
+    for attempt in range(max_attempts):
+        attempt_seed = rng_seed + attempt
+
+        latent_out = sample_fn(
+            model,
+            speaker_latent,
+            speaker_mask,
+            text_input_ids,
+            text_mask,
+            attempt_seed,
+        )
+
+        audio_out = _ae_decode_with_flatten(fish_ae, pca_state, latent_out)
+
+        # Apply 50ms fadeout to avoid clicks at end
+        fadeout_samples = min(int(0.05 * SAMPLE_RATE), audio_out.shape[-1])
+        if fadeout_samples > 0:
+            t = torch.linspace(0.0, 1.0, fadeout_samples, device=audio_out.device)
+            fade = (1.0 - t) ** 3
+            audio_out[..., -fadeout_samples:] = audio_out[..., -fadeout_samples:] * fade
+
+        pcm = _audio_to_pcm(audio_out)
+
+        if not VAD_REROLL_ENABLED:
+            break
+
+        has_silence, silence_ms = _check_silence_vad(audio_out, VAD_SILENCE_THRESHOLD_MS)
+
+        if silence_ms < best_silence_ms:
+            best_silence_ms = silence_ms
+            best_pcm = pcm
+
+        if not has_silence:
+            print(f"[vad] Non-stream: passed on attempt {attempt + 1}")
+            break
+        else:
+            if attempt < max_attempts - 1:
+                print(f"[vad] Non-stream: rerolling (attempt {attempt + 1}/{max_attempts}, silence={silence_ms:.0f}ms)")
+            else:
+                print(f"[vad] Non-stream: using best attempt after {max_attempts} tries (silence={best_silence_ms:.0f}ms)")
+                pcm = best_pcm
+
     torch.cuda.empty_cache()
     return pcm
 
@@ -1152,6 +1320,7 @@ def _warmup_compile(block_sizes: List[int], num_steps: List[int]) -> None:
                 zero_eps=DEFAULT_ZERO_EPS,
                 zero_tail_min_frac=DEFAULT_ZERO_TAIL_MIN_FRAC,
                 zero_tail_frames=DEFAULT_ZERO_TAIL_FRAMES,
+                zero_tail_absmax=DEFAULT_ZERO_TAIL_ABSMAX,
                 guidance_mode=GuidanceMode.INDEPENDENT,
                 max_text_length=768,
             )
@@ -1352,6 +1521,8 @@ def _stream_blocks(
     first_block_started_at = None
     ttfb_reported = False
     final_block_start_samples = 0
+    # Track seed across blocks for VAD continuity (same seed unless reroll needed)
+    current_seed = rng_seed
 
     for block_idx, (block_size, block_steps) in enumerate(
         zip(cfg.block_sizes, step_counts)
@@ -1411,133 +1582,229 @@ def _stream_blocks(
             kv_cache_latent = _get_first_n_kv_cache(kv_cache_latent_full, batch_size)
         kv_time = time.time() - kv_start
 
-        # Time diffusion steps
-        diffusion_start = time.time()
-        x_t = torch.randn((batch_size, block_size, 80), device=block_device, dtype=torch.float32)
-        if block_trunc is not None:
-            x_t = x_t * block_trunc
+        # VAD reroll loop
+        max_vad_attempts = VAD_MAX_REROLLS + 1 if VAD_REROLL_ENABLED else 1
+        best_x_t: Optional[torch.Tensor] = None
+        best_new_audio: Optional[torch.Tensor] = None
+        best_silence_ms = float("inf")
+        best_attempt = 0  # Track which attempt had least silence
+        successful_attempt = 0  # Track which attempt succeeded (for seed carry-forward)
+        decoder_state_before_block: Optional[Dict[str, Any]] = None
+        if VAD_REROLL_ENABLED:
+            decoder_state_before_block = streaming_decoder.get_state()
+        final_x_t: Optional[torch.Tensor] = None
+        final_new_audio: Optional[torch.Tensor] = None
+        final_diffusion_time = 0.0
+        final_decode_time = 0.0
 
-        for i in range(block_steps):
-            t, t_next = t_schedule[i], t_schedule[i + 1]
-            has_cfg = ((t >= cfg.cfg_min_t) * (t <= cfg.cfg_max_t)).item()
+        for vad_attempt in range(max_vad_attempts):
+            # Restore decoder state for each attempt (except first)
+            if vad_attempt > 0 and decoder_state_before_block is not None:
+                streaming_decoder.set_state(decoder_state_before_block)
 
-            if use_lora_block:
-                v_pred = model_for_block(
-                    x=x_t.to(block_dtype),
-                    t=(torch.ones((batch_size,), device=block_device) * t).to(block_dtype),
-                    text_mask=block_text_mask_lora,
-                    speaker_mask=block_speaker_mask_lora,
-                    start_pos=pos_id,
-                    kv_cache_text=kv_cache_text_full_lora,
-                    kv_cache_speaker=kv_cache_speaker_full_lora,
-                    kv_cache_latent=kv_cache_latent_full,
-                ).float()
-            elif has_cfg:
-                v_cond, v_uncond_text, v_uncond_speaker = model_for_block(
-                    x=torch.cat([x_t, x_t, x_t], dim=0).to(block_dtype),
-                    t=(torch.ones((batch_size * 3,), device=block_device) * t).to(block_dtype),
-                    text_mask=block_full_text_mask,
-                    speaker_mask=block_full_speaker_mask,
-                    start_pos=pos_id,
-                    kv_cache_text=kv_cache_text_full,
-                    kv_cache_speaker=kv_cache_speaker_full,
-                    kv_cache_latent=kv_cache_latent_full,
-                ).float().chunk(3, dim=0)
+            # Seed for this block attempt (only reseed on reroll attempts to preserve RNG flow across blocks)
+            if VAD_REROLL_ENABLED and vad_attempt > 0:
+                block_seed = current_seed + vad_attempt
+                torch.manual_seed(block_seed)
 
-                v_pred = (
-                    v_cond
-                    + cfg.cfg_scale_text * (v_cond - v_uncond_text)
-                    + cfg.cfg_scale_speaker * (v_cond - v_uncond_speaker)
-                )
+            # Time diffusion steps
+            diffusion_start = time.time()
+            x_t = torch.randn((batch_size, block_size, 80), device=block_device, dtype=torch.float32)
+            if block_trunc is not None:
+                x_t = x_t * block_trunc
+
+            for i in range(block_steps):
+                t, t_next = t_schedule[i], t_schedule[i + 1]
+                has_cfg = ((t >= cfg.cfg_min_t) * (t <= cfg.cfg_max_t)).item()
+
+                if use_lora_block:
+                    v_pred = model_for_block(
+                        x=x_t.to(block_dtype),
+                        t=(torch.ones((batch_size,), device=block_device) * t).to(block_dtype),
+                        text_mask=block_text_mask_lora,
+                        speaker_mask=block_speaker_mask_lora,
+                        start_pos=pos_id,
+                        kv_cache_text=kv_cache_text_full_lora,
+                        kv_cache_speaker=kv_cache_speaker_full_lora,
+                        kv_cache_latent=kv_cache_latent_full,
+                    ).float()
+                elif has_cfg:
+                    v_cond, v_uncond_text, v_uncond_speaker = model_for_block(
+                        x=torch.cat([x_t, x_t, x_t], dim=0).to(block_dtype),
+                        t=(torch.ones((batch_size * 3,), device=block_device) * t).to(block_dtype),
+                        text_mask=block_full_text_mask,
+                        speaker_mask=block_full_speaker_mask,
+                        start_pos=pos_id,
+                        kv_cache_text=kv_cache_text_full,
+                        kv_cache_speaker=kv_cache_speaker_full,
+                        kv_cache_latent=kv_cache_latent_full,
+                    ).float().chunk(3, dim=0)
+
+                    v_pred = (
+                        v_cond
+                        + cfg.cfg_scale_text * (v_cond - v_uncond_text)
+                        + cfg.cfg_scale_speaker * (v_cond - v_uncond_speaker)
+                    )
+                else:
+                    v_pred = model_for_block(
+                        x=x_t.to(block_dtype),
+                        t=(torch.ones((batch_size,), device=block_device) * t).to(block_dtype),
+                        text_mask=block_text_mask,
+                        speaker_mask=block_speaker_mask,
+                        start_pos=pos_id,
+                        kv_cache_text=kv_cache_text,
+                        kv_cache_speaker=kv_cache_speaker,
+                        kv_cache_latent=kv_cache_latent,
+                    ).float()
+
+                if cfg.rescale_k is not None and cfg.rescale_sigma is not None:
+                    v_pred = _temporal_score_rescale(
+                        v_pred, x_t, float(t), cfg.rescale_k, cfg.rescale_sigma
+                    )
+
+                if (
+                    cfg.speaker_kv_scale is not None
+                    and cfg.speaker_kv_min_t is not None
+                    and t_next < cfg.speaker_kv_min_t
+                    and t >= cfg.speaker_kv_min_t
+                ):
+                    target_kv = kv_cache_speaker_full_lora if use_lora_block else kv_cache_speaker_full
+                    _multiply_speaker_kv_cache(
+                        target_kv,
+                        1.0 / cfg.speaker_kv_scale,
+                        text_input_ids.shape[-1],
+                        cfg.speaker_kv_max_layers,
+                    )
+
+                x_t = x_t + v_pred * (t_next - t)
+
+            diffusion_time = time.time() - diffusion_start
+
+            # Temporarily update prefix_latent for flattening point calculation
+            prefix_latent[:, pos_id : pos_id + block_size] = x_t
+
+            # Early stop detection per block
+            early_stop = False
+            if cfg.early_stop_on_zero:
+                tail_len = min(cfg.zero_tail_frames, x_t.shape[1])
+                tail = x_t[:, -tail_len:]
+                tail_abs = torch.abs(tail)
+                zero_frac = float((tail_abs <= cfg.zero_eps).float().mean().item())
+                tail_absmax = float(tail_abs.max().item())
+                zero_ok = zero_frac >= cfg.zero_tail_min_frac and tail_absmax <= cfg.zero_tail_absmax
+                if zero_ok:
+                    early_stop = True
+                    if vad_attempt == 0:  # Only log on first attempt
+                        print(
+                            f"[early_stop] block {block_idx+1}/{len(cfg.block_sizes)} "
+                            f"tail_len={tail_len} zero_frac={zero_frac:.3f} "
+                            f"absmax={tail_absmax:.3e} absmax_thresh={cfg.zero_tail_absmax} min_frac={cfg.zero_tail_min_frac}"
+                        )
+                else:
+                    if vad_attempt == 0:  # Only log on first attempt
+                        _log_debug(
+                            f"[zero_tail_check] block {block_idx+1}/{len(cfg.block_sizes)} "
+                            f"tail_len={tail_len} zero_frac={zero_frac:.3f} "
+                            f"absmax={tail_absmax:.3e} absmax_thresh={cfg.zero_tail_absmax} min_frac={cfg.zero_tail_min_frac}"
+                        )
+
+            is_last_planned = (block_idx == len(cfg.block_sizes) - 1)
+            will_finish = early_stop or is_last_planned
+
+            flatten_point = None
+            if will_finish:
+                prefix_latent_trim = prefix_latent[:, :pos_id + block_size]
+                flatten_point = find_flattening_point(prefix_latent_trim[0])
+                already_emitted_latents = streaming_decoder._emitted_samples // streaming_decoder.samples_per_latent
+                flatten_point = max(flatten_point, already_emitted_latents)
+
+            # Decode block audio with streaming context
+            decode_start = time.time()
+            new_audio = streaming_decoder.decode_next(
+                x_t.to(next(fish_ae.parameters()).device),
+                flattening_point=flatten_point,
+            )
+            decode_time = time.time() - decode_start
+
+            # VAD check if enabled
+            # Skip VAD if: disabled, or audio too short to contain a silence >= threshold
+            audio_duration_ms = (new_audio.numel() / SAMPLE_RATE) * 1000.0 if new_audio.numel() > 0 else 0.0
+            skip_vad = not VAD_REROLL_ENABLED or audio_duration_ms < VAD_SILENCE_THRESHOLD_MS
+            if skip_vad:
+                final_x_t = x_t
+                final_new_audio = new_audio
+                final_diffusion_time = diffusion_time
+                final_decode_time = decode_time
+                break
+
+            has_silence, silence_ms = _check_silence_vad(new_audio, VAD_SILENCE_THRESHOLD_MS)
+
+            # Track best attempt
+            if silence_ms < best_silence_ms:
+                best_silence_ms = silence_ms
+                best_x_t = x_t.clone()
+                best_new_audio = new_audio.clone() if new_audio.numel() > 0 else new_audio
+                best_attempt = vad_attempt
+
+            if not has_silence:
+                print(f"[vad] Block {block_idx+1}: passed on attempt {vad_attempt + 1}")
+                successful_attempt = vad_attempt
+                final_x_t = x_t
+                final_new_audio = new_audio
+                final_diffusion_time = diffusion_time
+                final_decode_time = decode_time
+                break
             else:
-                v_pred = model_for_block(
-                    x=x_t.to(block_dtype),
-                    t=(torch.ones((batch_size,), device=block_device) * t).to(block_dtype),
-                    text_mask=block_text_mask,
-                    speaker_mask=block_speaker_mask,
-                    start_pos=pos_id,
-                    kv_cache_text=kv_cache_text,
-                    kv_cache_speaker=kv_cache_speaker,
-                    kv_cache_latent=kv_cache_latent,
-                ).float()
+                if vad_attempt < max_vad_attempts - 1:
+                    print(f"[vad] Block {block_idx+1}: rerolling (attempt {vad_attempt + 1}/{max_vad_attempts}, silence={silence_ms:.0f}ms)")
+                else:
+                    print(f"[vad] Block {block_idx+1}: using best attempt after {max_vad_attempts} tries (silence={best_silence_ms:.0f}ms)")
+                    successful_attempt = best_attempt
+                    # Restore decoder state and use best attempt
+                    streaming_decoder.set_state(decoder_state_before_block)
+                    final_x_t = best_x_t
+                    # Recalculate flatten_point with best_x_t
+                    prefix_latent[:, pos_id : pos_id + block_size] = best_x_t
+                    best_flatten_point = None
+                    if will_finish:
+                        prefix_latent_trim = prefix_latent[:, :pos_id + block_size]
+                        best_flatten_point = find_flattening_point(prefix_latent_trim[0])
+                        already_emitted_latents = streaming_decoder._emitted_samples // streaming_decoder.samples_per_latent
+                        best_flatten_point = max(best_flatten_point, already_emitted_latents)
+                    # Re-decode with best_x_t
+                    decode_start = time.time()
+                    final_new_audio = streaming_decoder.decode_next(
+                        best_x_t.to(next(fish_ae.parameters()).device),
+                        flattening_point=best_flatten_point,
+                    )
+                    final_decode_time = time.time() - decode_start
+                    final_diffusion_time = diffusion_time  # Use last diffusion time
 
-            if cfg.rescale_k is not None and cfg.rescale_sigma is not None:
-                v_pred = _temporal_score_rescale(
-                    v_pred, x_t, float(t), cfg.rescale_k, cfg.rescale_sigma
-                )
+        # Use final results
+        x_t = final_x_t
+        new_audio = final_new_audio
+        diffusion_time = final_diffusion_time
+        decode_time = final_decode_time
 
-            if (
-                cfg.speaker_kv_scale is not None
-                and cfg.speaker_kv_min_t is not None
-                and t_next < cfg.speaker_kv_min_t
-                and t >= cfg.speaker_kv_min_t
-            ):
-                target_kv = kv_cache_speaker_full_lora if use_lora_block else kv_cache_speaker_full
-                _multiply_speaker_kv_cache(
-                    target_kv,
-                    1.0 / cfg.speaker_kv_scale,
-                    text_input_ids.shape[-1],
-                    cfg.speaker_kv_max_layers,
-                )
+        # Carry seed forward for next blocks (only advances if reroll was needed)
+        if VAD_REROLL_ENABLED and successful_attempt > 0:
+            current_seed += successful_attempt
 
-            x_t = x_t + v_pred * (t_next - t)
-
-        diffusion_time = time.time() - diffusion_start
+        # Commit to prefix_latent with final x_t
         prefix_latent[:, pos_id : pos_id + block_size] = x_t
         pos_id += block_size
-
-        # Early stop detection per block
-        early_stop = False
-        if cfg.early_stop_on_zero:
-            tail_len = min(cfg.zero_tail_frames, x_t.shape[1])
-            tail = x_t[:, -tail_len:]
-            tail_abs = torch.abs(tail)
-            zero_frac = float((tail_abs <= cfg.zero_eps).float().mean().item())
-            tail_absmax = float(tail_abs.max().item())
-            zero_ok = zero_frac >= cfg.zero_tail_min_frac and tail_absmax <= cfg.zero_eps
-            if zero_ok:
-                early_stop = True
-                print(
-                    f"[early_stop] block {block_idx+1}/{len(cfg.block_sizes)} "
-                    f"tail_len={tail_len} zero_frac={zero_frac:.3f} "
-                    f"absmax={tail_absmax:.3e} eps={cfg.zero_eps} min_frac={cfg.zero_tail_min_frac}"
-                )
-            else:
-                _log_debug(
-                    f"[zero_tail_check] block {block_idx+1}/{len(cfg.block_sizes)} "
-                    f"tail_len={tail_len} zero_frac={zero_frac:.3f} "
-                    f"absmax={tail_absmax:.3e} eps={cfg.zero_eps} min_frac={cfg.zero_tail_min_frac}"
-                )
-
-        is_last_planned = (block_idx == len(cfg.block_sizes) - 1)
-        will_finish = early_stop or is_last_planned
-
-        flatten_point = None
-        if will_finish:
-            prefix_latent_trim = prefix_latent[:, :pos_id]
-            flatten_point = find_flattening_point(prefix_latent_trim[0])
-            already_emitted_latents = streaming_decoder._emitted_samples // streaming_decoder.samples_per_latent
-            flatten_point = max(flatten_point, already_emitted_latents)
-
-        # Decode block audio with streaming context
-        decode_start = time.time()
-        new_audio = streaming_decoder.decode_next(
-            x_t.to(next(fish_ae.parameters()).device),
-            flattening_point=flatten_point,
-        )
-        decode_time = time.time() - decode_start
 
         # Calculate audio duration and RTFx
         audio_samples = new_audio.numel() if new_audio.numel() > 0 else 0
         audio_duration_ms = (audio_samples / SAMPLE_RATE) * 1000.0 if audio_samples > 0 else 0.0
-        
+
         # Total generation time for this chunk (diffusion + decode)
         chunk_gen_time = time.time() - block_start_time
         chunk_gen_time_ms = chunk_gen_time * 1000.0
-        
+
         # RTFx: generation_time / audio_duration (lower is better, <1.0 means faster than realtime)
         rtfx = chunk_gen_time / (audio_duration_ms / 1000.0) if audio_duration_ms > 0 else 0.0
-        
+
         print(
             f"[chunk {block_idx+1}/{len(cfg.block_sizes)}] "
             f"RTFx={rtfx:.3f} | "
@@ -1555,7 +1822,30 @@ def _stream_blocks(
             ttfb_reported = True
 
         if new_audio.numel() > 0:
+            # Apply 50ms fadeout on last block to avoid clicks
+            if will_finish:
+                fadeout_samples = min(int(0.05 * SAMPLE_RATE), new_audio.shape[-1])
+                if fadeout_samples > 0:
+                    # Power curve fade: gradual at start, steeper drop at end
+                    t = torch.linspace(0.0, 1.0, fadeout_samples, device=new_audio.device)
+                    fade = (1.0 - t) ** 3
+                    new_audio[..., -fadeout_samples:] = new_audio[..., -fadeout_samples:] * fade
             yield _audio_to_pcm(new_audio)
+
+        # Re-evaluate will_finish with final x_t for early stopping
+        early_stop = False
+        if cfg.early_stop_on_zero:
+            tail_len = min(cfg.zero_tail_frames, x_t.shape[1])
+            tail = x_t[:, -tail_len:]
+            tail_abs = torch.abs(tail)
+            zero_frac = float((tail_abs <= cfg.zero_eps).float().mean().item())
+            tail_absmax = float(tail_abs.max().item())
+            zero_ok = zero_frac >= cfg.zero_tail_min_frac and tail_absmax <= cfg.zero_tail_absmax
+            if zero_ok:
+                early_stop = True
+
+        is_last_planned = (block_idx == len(cfg.block_sizes) - 1)
+        will_finish = early_stop or is_last_planned
 
         if will_finish:
             break
@@ -1573,12 +1863,13 @@ class SpeechRequest(BaseModel):
         description="pcm only for streaming; non-stream supports pcm/wav/mp3 (defaults to mp3 if ffmpeg is available, else wav).",
     )
     stream: bool = Field(default=True)
-    seed: int = Field(default=0)
-    extra_body: Dict[str, Any] = Field(default_factory=dict, description="Optional sampler overrides")
+    extra_body: Dict[str, Any] = Field(default_factory=dict, description="Optional overrides (seed, sampler params, etc.)")
 
 
 def _run_startup_tasks() -> None:
     _load_components()
+    if VAD_REROLL_ENABLED:
+        _load_vad_model()
     _load_compile_cache(DEFAULT_BLOCK_SIZES)
     if DEFAULT_BLOCK_SIZES != [DEFAULT_BLOCK_SIZE_NONSTREAM]:
         _load_compile_cache([DEFAULT_BLOCK_SIZE_NONSTREAM])
@@ -1591,12 +1882,9 @@ def _resolve_response_format(requested: Optional[str], stream: bool) -> str:
     if requested is None or str(requested).strip() == "":
         return "pcm" if stream else ("mp3" if FFMPEG_PATH else "wav")
     fmt = str(requested).strip().lower()
-    allowed = {"pcm"} if stream else {"pcm", "wav", "mp3"}
-    if fmt not in allowed:
+    if fmt not in {"pcm", "wav", "mp3"}:
         raise HTTPException(status_code=400, detail="response_format must be one of 'pcm', 'wav', 'mp3'")
-    if stream and fmt != "pcm":
-        raise HTTPException(status_code=400, detail="Streaming currently supports response_format='pcm' only")
-    if (not stream) and fmt == "mp3" and not FFMPEG_PATH:
+    if fmt == "mp3" and not FFMPEG_PATH:
         raise HTTPException(status_code=400, detail="response_format='mp3' requires ffmpeg in PATH")
     return fmt
 
@@ -1619,6 +1907,10 @@ def list_voices() -> Dict[str, Any]:
 @app.post("/v1/audio/speech")
 def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> StreamingResponse:
     route_start = time.time()
+    # Extract seed from extra_body, default to random (-1)
+    seed = int(payload.extra_body.get("seed", -1))
+    if seed < 0:
+        seed = random.randint(0, 2**31 - 1)
     _load_components()
     _log_debug(f"[route] after load_components: {(time.time() - route_start)*1000:.2f} ms")
     response_format = _resolve_response_format(payload.response_format, payload.stream)
@@ -1663,8 +1955,13 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
     if not payload.stream:
         if "block_sizes" not in payload.extra_body:
             sampler_cfg.block_sizes = [DEFAULT_BLOCK_SIZE_NONSTREAM]
-        if "num_steps" not in payload.extra_body:
-            sampler_cfg.num_steps = [DEFAULT_NUM_STEPS_NONSTREAM for _ in sampler_cfg.block_sizes]
+        num_steps_raw = payload.extra_body.get("num_steps")
+        if num_steps_raw is None:
+            sampler_cfg.num_steps = [DEFAULT_NUM_STEPS_NONSTREAM]
+        elif isinstance(num_steps_raw, int):
+            sampler_cfg.num_steps = [num_steps_raw]
+        else:
+            sampler_cfg.num_steps = [int(x) for x in num_steps_raw]
 
     chunk_cfgs: List[SamplerConfig]
     override_secondary = (
@@ -1685,12 +1982,14 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
         chunk_cfgs = [sampler_cfg for _ in chunks]
 
     if payload.stream:
-        collected: Optional[bytearray] = bytearray() if DEBUG_LOGS_ENABLED else None
+        # For wav/mp3 format, we must collect all chunks then convert; for pcm, stream directly
+        stream_buffered = response_format in ("wav", "mp3")
+        collected: Optional[bytearray] = bytearray() if (DEBUG_LOGS_ENABLED or stream_buffered) else None
         disconnect_exception: type[Exception] = type("ClientDisconnected", (Exception,), {})
 
         def _run_stream() -> Iterable[bytes]:
             for idx, chunk in enumerate(chunks):
-                chunk_seed = payload.seed + idx
+                chunk_seed = seed + idx
                 cfg_for_chunk = chunk_cfgs[idx] if idx < len(chunk_cfgs) else sampler_cfg
                 _log_debug(f"[route] starting chunk {idx+1}/{len(chunks)} seed={chunk_seed}")
                 for block in _stream_blocks(
@@ -1732,7 +2031,9 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
                         emitted = True
                         if collected is not None:
                             collected.extend(chunk)
-                        yield chunk
+                        # For wav/mp3 format, don't yield chunks - we'll convert and yield at end
+                        if not stream_buffered:
+                            yield chunk
                 except disconnect_exception:
                     _log_debug("[route] disconnect propagated; aborting remaining chunks")
                 except RuntimeError as exc:
@@ -1746,15 +2047,25 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
                         async for chunk in _drain_stream(stream_iter):
                             if collected is not None:
                                 collected.extend(chunk)
-                            yield chunk
+                            if not stream_buffered:
+                                yield chunk
                     else:
                         raise
             finally:
                 _close_iter(stream_iter)
 
+            # For wav/mp3 format, convert accumulated PCM and yield at end
+            if stream_buffered and collected:
+                pcm_bytes = bytes(collected)
+                if response_format == "wav":
+                    yield _pcm16_to_wav_bytes(pcm_bytes, SAMPLE_RATE)
+                elif response_format == "mp3":
+                    yield _encode_mp3_from_pcm(pcm_bytes, SAMPLE_RATE)
+
+        stream_media_type = {"wav": "audio/wav", "mp3": "audio/mpeg"}.get(response_format, "application/octet-stream")
         response = StreamingResponse(
             _generator(),
-            media_type="application/octet-stream",
+            media_type=stream_media_type,
             headers={"X-Audio-Sample-Rate": str(SAMPLE_RATE)},
         )
         _log_debug(
@@ -1778,7 +2089,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
     try:
         collected = bytearray()
         for idx, chunk in enumerate(chunks):
-            chunk_seed = payload.seed + idx
+            chunk_seed = seed + idx
             cfg_for_chunk = chunk_cfgs[idx] if idx < len(chunk_cfgs) else sampler_cfg
             _log_debug(f"[route] (non-stream) starting chunk {idx+1}/{len(chunks)} seed={chunk_seed}")
             audio_tensor = _generate_full_audio_bytes(
@@ -1796,7 +2107,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
             _load_components(force_reinit=True, force_compile=False)
             collected = bytearray()
             for idx, chunk in enumerate(chunks):
-                chunk_seed = payload.seed + idx
+                chunk_seed = seed + idx
                 cfg_for_chunk = chunk_cfgs[idx] if idx < len(chunk_cfgs) else sampler_cfg
                 _log_debug(f"[route] (non-stream) retry chunk {idx+1}/{len(chunks)} seed={chunk_seed}")
                 audio_tensor_part = _generate_full_audio_bytes(
