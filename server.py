@@ -3,6 +3,7 @@ import subprocess
 import time
 import json
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from new.config import config
 from new.inference_engine import engine, GenerationConfig
+from new.batching import BatchScheduler
 from new.speaker_latents import SpeakerLatentManager, create_speaker_latent_manager
 from samplers import GuidanceMode
 from utils import chunk_text_by_time
@@ -22,6 +24,8 @@ from utils import chunk_text_by_time
 
 # Global state
 _speaker_manager: Optional[SpeakerLatentManager] = None
+_batch_scheduler: Optional[BatchScheduler] = None
+_server_ready: bool = False
 FFMPEG_PATH = shutil.which("ffmpeg")
 
 
@@ -31,6 +35,13 @@ def get_speaker_manager() -> SpeakerLatentManager:
     if _speaker_manager is None:
         raise RuntimeError("Speaker manager not initialized. Server not started properly.")
     return _speaker_manager
+
+
+def get_batch_scheduler() -> BatchScheduler:
+    global _batch_scheduler
+    if _batch_scheduler is None:
+        raise RuntimeError("Batch scheduler not initialized. Server not started properly.")
+    return _batch_scheduler
 
 
 def _encode_mp3_from_pcm(pcm: bytes, sample_rate: int) -> bytes:
@@ -169,7 +180,7 @@ def _parse_generation_config(extra_body: Dict[str, Any], streaming: bool = True)
 
 def _initialize_server() -> None:
     """Initialize all server components."""
-    global _speaker_manager
+    global _speaker_manager, _batch_scheduler, _server_ready
     
     print("🚀 Initializing Echo TTS Server...")
     
@@ -187,6 +198,14 @@ def _initialize_server() -> None:
     print("  Creating speaker latent manager...")
     _speaker_manager = create_speaker_latent_manager()
     _speaker_manager.set_patch_size(getattr(engine.model, "speaker_patch_size", 4))
+
+    # Create batching scheduler (websocket path)
+    # Note: started in lifespan (async) after init completes.
+    _batch_scheduler = BatchScheduler(
+        engine=engine,
+        max_batch_size=int(os.getenv("ECHO_MAX_BATCH", "8")),
+        batch_wait_ms=float(os.getenv("ECHO_BATCH_WAIT_MS", "4.0")),
+    )
     
     # Pre-warm specified voices
     if config.voice.prewarm_voices:
@@ -199,6 +218,7 @@ def _initialize_server() -> None:
         _run_warmup()
     
     print("✅ Server initialization complete!")
+    _server_ready = True
 
 
 def _run_warmup() -> None:
@@ -289,7 +309,20 @@ def _run_warmup() -> None:
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     _initialize_server()
+    # Start websocket batching scheduler
+    await get_batch_scheduler().start()
+    # Warm up batched shapes to avoid first real batched request compiling for minutes
+    if config.model.use_compile:
+        try:
+            await asyncio.to_thread(get_batch_scheduler().warmup)
+        except Exception as exc:
+            print(f"⚠️ Batch scheduler warmup failed: {exc}")
     yield
+    # Stop batching scheduler
+    try:
+        await get_batch_scheduler().stop()
+    except Exception:
+        pass
 
 
 # Create FastAPI app
@@ -322,6 +355,8 @@ class SpeechRequest(BaseModel):
 @app.get("/health")
 def health() -> Dict[str, str]:
     """Health check endpoint."""
+    if not _server_ready:
+        raise HTTPException(status_code=503, detail="starting")
     return {"status": "ok"}
 
 
@@ -555,9 +590,6 @@ async def tts_stream_ws(websocket: WebSocket):
                 print(f"[ws] Generating segment {segment_id} for input: '{input_text[:30]}...'")
                 print(f"[ws] Voice: {voice}, Seed: {seed}")
             
-            start_time = time.perf_counter()
-            first_chunk = True
-            
             try:
                 # Get speaker latent (should be fast if cached)
                 speaker_latent = get_speaker_manager().get_latent(voice, engine.device)
@@ -568,31 +600,31 @@ async def tts_stream_ws(websocket: WebSocket):
 
                 # Configure generation
                 gen_config = _parse_generation_config(extra_body, streaming=True)
-                
-                # Generate and stream
-                # Note: We rely on engine.generate_streaming returning an iterator of bytes
-                chunk_idx = 0
-                total_bytes_sent = 0
-                for chunk in engine.generate_streaming(
+
+                # Submit to scheduler and stream from its output queue.
+                # This keeps the WS event loop responsive and enables micro-batching.
+                out_q = await get_batch_scheduler().submit(
+                    request_id=segment_id,
                     text=input_text,
+                    voice=voice,
+                    seed=seed,
+                    gen_config=gen_config,
                     speaker_latent=speaker_latent.latent,
                     speaker_mask=speaker_latent.mask,
-                    gen_config=gen_config,
-                    rng_seed=seed,
-                ):
-                    if first_chunk:
-                        ttfb = time.perf_counter() - start_time
-                        if config.server.debug_logs:
-                            print(f"[ws] TTFB: {ttfb*1000:.2f} ms")
-                        first_chunk = False
-                    
+                )
+
+                chunk_idx = 0
+                total_bytes_sent = 0
+                while True:
+                    chunk = await out_q.get()
+                    if chunk is None:
+                        break
                     if config.server.debug_logs:
-                        print(f"[ws] Chunk {chunk_idx}: {len(chunk)} bytes. Start: {chunk[:4].hex()} End: {chunk[-4:].hex()}")
-                    
+                        print(f"[ws] Chunk {chunk_idx}: {len(chunk)} bytes")
                     await websocket.send_bytes(chunk)
                     chunk_idx += 1
                     total_bytes_sent += len(chunk)
-                
+
                 if config.server.debug_logs:
                     print(f"[ws] Total bytes sent: {total_bytes_sent}")
                 

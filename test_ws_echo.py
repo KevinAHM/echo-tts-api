@@ -4,13 +4,16 @@ import json
 import time
 import wave
 import struct
+import os
+import statistics
 
 SERVER_URL = "ws://localhost:8000/v1/audio/speech/stream/ws"
+HEALTH_URL = "http://localhost:8000/health"
 OUTPUT_FILE = "test_output_ws.wav"
 SAMPLE_RATE = 44100  # Match Server Config
 # voice = "maya_long_ref"
 # voice = "golum"
-voice = "little_dude"
+voice = "maya_ref"
 # voice = "expresso_02_ex03-ex01_calm_005"
 # voice = "maya_voices"
 # text = "(laughs) This is so tedious. I can barely stay awake through this."
@@ -21,17 +24,17 @@ voice = "little_dude"
 # # text = "(singing) Hope you have an amazing day today."
 
 text = "Hello (laughs) This is a test of the Echo TTS streaming WebSocket. How does it sound?"
-text = "That's hilarious! (laughs) I can't believe that actually happened to you."
-text = "I'm so happy for you! (laughs) That's the best news I've heard all week."
+# text = "That's hilarious! (laughs) I can't believe that actually happened to you."
+# text = "I'm so happy for you! (laughs) That's the best news I've heard all week."
 
-# text = "Hey, I think someone's at the door."
-text = "(whispers) Should I check who it is?"
+# # text = "Hey, I think someone's at the door."
+# text = "(whispers) Should I check who it is?"
 
-# text = "(sighs) I've been trying to solve this problem all day."
-# # text = "(sighs) I tried so hard to prevent it."
-text = "(sighs) Everything feels different now."
+# # text = "(sighs) I've been trying to solve this problem all day."
+# # # text = "(sighs) I tried so hard to prevent it."
+# text = "(sighs) Everything feels different now."
 
-text = "(sobbing) I just can't handle this anymore."
+# text = "(sobbing) I just can't handle this anymore."
 # # text = "(sobbing) Everything is falling apart."
 # # text = "(sobbing) Why did this have to happen?"
 
@@ -407,5 +410,99 @@ async def test_echo_ws():
             print(f"❌ Connection failed: {e}")
             print("Make sure the server is running: python server.py")
 
+
+async def run_one_client(client_idx: int, save_wav: bool = False) -> float | None:
+    """Run one websocket request and return TTFB (ms)."""
+    seg_id = f"test_seg_{client_idx}"
+    local_seed = seed + client_idx
+
+    req = {
+        "input": text,
+        "voice": voice,
+        "segment_id": seg_id,
+        "seed": local_seed,
+        "extra_body": extra_body,
+        "continue": True,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.ws_connect(SERVER_URL) as ws:
+                await ws.send_json(req)
+
+                start_time = time.perf_counter()
+                first_chunk = True
+                ttfb_ms: float | None = None
+                audio_data = bytearray()
+
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        msg_type = data.get("type")
+                        if msg_type == "end":
+                            # close
+                            await ws.send_json({"continue": False})
+                        elif "done" in data or "error" in data:
+                            break
+
+                    elif msg.type == aiohttp.WSMsgType.BINARY:
+                        if first_chunk:
+                            ttfb_ms = (time.perf_counter() - start_time) * 1000
+                            print(f"[client {client_idx}] ⚡ TTFB: {ttfb_ms:.2f} ms")
+                            first_chunk = False
+                        audio_data.extend(msg.data)
+
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+
+                if save_wav and audio_data:
+                    out = f"test_output_ws_{client_idx}.wav"
+                    try:
+                        with wave.open(out, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(SAMPLE_RATE)
+                            wf.writeframes(audio_data)
+                        print(f"[client {client_idx}] ✅ Saved {len(audio_data)} bytes to {out}")
+                    except Exception as e:
+                        print(f"[client {client_idx}] ❌ Failed to save audio: {e}")
+
+                return ttfb_ms
+        except aiohttp.ClientConnectorError as e:
+            print(f"[client {client_idx}] ❌ Connection failed: {e}")
+            return None
+
+
+async def load_test(concurrency: int, save_wav: bool = False) -> None:
+    # Wait for server readiness (warmup/compile can take a while)
+    async with aiohttp.ClientSession() as session:
+        for _ in range(600):
+            try:
+                async with session.get(HEALTH_URL, timeout=2) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+    tasks = [asyncio.create_task(run_one_client(i, save_wav=save_wav)) for i in range(concurrency)]
+    results = await asyncio.gather(*tasks)
+    ttfbs = [r for r in results if r is not None]
+    if not ttfbs:
+        print("No successful clients.")
+        return
+    ttfbs_sorted = sorted(ttfbs)
+    p50 = statistics.median(ttfbs_sorted)
+    p90 = ttfbs_sorted[int(0.9 * (len(ttfbs_sorted) - 1))]
+    p99 = ttfbs_sorted[int(0.99 * (len(ttfbs_sorted) - 1))] if len(ttfbs_sorted) > 1 else ttfbs_sorted[0]
+    print(f"TTFB ms: n={len(ttfbs_sorted)} p50={p50:.2f} p90={p90:.2f} p99={p99:.2f} max={max(ttfbs_sorted):.2f}")
+
+
 if __name__ == "__main__":
-    asyncio.run(test_echo_ws())
+    # Set ECHO_CONCURRENCY=N to run N concurrent websocket calls (default 1).
+    conc = int(os.getenv("ECHO_CONCURRENCY", "1"))
+    if conc <= 1:
+        asyncio.run(test_echo_ws())
+    else:
+        # Always save WAV files for concurrent calls to check quality
+        asyncio.run(load_test(conc, save_wav=True))
