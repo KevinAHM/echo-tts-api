@@ -10,7 +10,7 @@ OUTPUT_FILE = "test_output_ws.wav"
 SAMPLE_RATE = 44100  # Match Server Config
 # voice = "maya_long_ref"
 # voice = "golum"
-voice = "tessa"
+voice = "little_dude"
 # voice = "expresso_02_ex03-ex01_calm_005"
 # voice = "maya_voices"
 # text = "(laughs) This is so tedious. I can barely stay awake through this."
@@ -25,13 +25,13 @@ text = "That's hilarious! (laughs) I can't believe that actually happened to you
 text = "I'm so happy for you! (laughs) That's the best news I've heard all week."
 
 # text = "Hey, I think someone's at the door."
-# text = "(whispers) Should I check who it is?"
+text = "(whispers) Should I check who it is?"
 
 # text = "(sighs) I've been trying to solve this problem all day."
-text = "(sighs) I tried so hard to prevent it."
-# text = "(sighs) Everything feels different now."
+# # text = "(sighs) I tried so hard to prevent it."
+text = "(sighs) Everything feels different now."
 
-# text = "(sobbing) I just can't handle this anymore."
+text = "(sobbing) I just can't handle this anymore."
 # # text = "(sobbing) Everything is falling apart."
 # # text = "(sobbing) Why did this have to happen?"
 
@@ -39,9 +39,9 @@ text = "(sighs) I tried so hard to prevent it."
 # text = "(gasps) Oh my goodness! I wasn't expecting that at all."
 
 # # text = "(yawns) Sorry, I'm a bit tired."
-# # text = "(yawns) What were you saying about the meeting?"
+# text = "(yawns) What were you saying about the meeting?"
 
-# # text = "Excuse me (coughs) Now, where were we in our conversation?"
+# text = "Excuse me (coughs). Now, where were we in our conversation? I thought we were talking about the weather."
 # # text = "I'm not feeling well today (coughs) ."
 
 # # text = "(shouts) Watch out! Get out of the way right now!"
