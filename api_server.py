@@ -1,8 +1,10 @@
 import base64
 import gzip
+import json
 import math
 import os
 import random
+import re
 import tempfile
 import io
 import wave
@@ -19,7 +21,7 @@ import torch
 import time
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.concurrency import iterate_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import torchaudio
@@ -88,6 +90,11 @@ FOLDER_SUPPORT = os.getenv("ECHO_FOLDER_SUPPORT", "1") == "1"
 VAD_REROLL_ENABLED = os.getenv("ECHO_VAD_REROLL_ENABLED", "0") == "1"
 VAD_MAX_REROLLS = int(os.getenv("ECHO_VAD_MAX_REROLLS", "3"))
 VAD_SILENCE_THRESHOLD_MS = int(os.getenv("ECHO_VAD_SILENCE_THRESHOLD_MS", "1000"))
+# Inworld TTS compatibility settings
+INWORLD_COMPAT_ENABLED = os.getenv("ECHO_INWORLD_COMPAT", "1") == "1"
+INWORLD_CLONE_ENABLED = os.getenv("ECHO_INWORLD_CLONE_ENABLED", "0") == "1"
+INWORLD_CLONE_SEPARATOR = "__"  # Inworld format: {workspace}__{voice}
+INWORLD_MAX_SAMPLE_SIZE = int(os.getenv("ECHO_INWORLD_MAX_SAMPLE_SIZE", str(100 * 1024 * 1024)))  # 100 MB
 # Performance presets
 _PERFORMANCE_PRESET_RAW = os.getenv("ECHO_PERFORMANCE_PRESET", "default")
 PERFORMANCE_PRESET = _PERFORMANCE_PRESET_RAW.strip().lower().replace("-", "_")
@@ -1866,6 +1873,95 @@ class SpeechRequest(BaseModel):
     extra_body: Dict[str, Any] = Field(default_factory=dict, description="Optional overrides (seed, sampler params, etc.)")
 
 
+# Inworld TTS API compatibility models
+class InworldAudioConfig(BaseModel):
+    audioEncoding: str = Field(default="MP3")
+    bitRate: Optional[int] = None
+    sampleRateHertz: Optional[int] = None
+    speakingRate: Optional[float] = None
+
+
+class InworldSynthesizeRequest(BaseModel):
+    text: str = Field(..., max_length=2000)
+    voiceId: str = Field(...)
+    audioConfig: Optional[InworldAudioConfig] = None
+    modelId: str = Field(default="inworld-tts-1")
+    temperature: Optional[float] = None
+    timestampType: Optional[str] = None
+    applyTextNormalization: Optional[str] = None
+
+
+class InworldVoiceSample(BaseModel):
+    audioData: str = Field(...)  # base64-encoded audio
+    transcription: Optional[str] = None
+
+
+class InworldCloneRequest(BaseModel):
+    displayName: str = Field(..., max_length=100)
+    langCode: str = Field(default="EN_US")
+    voiceSamples: List[InworldVoiceSample] = Field(...)
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    audioProcessingConfig: Optional[Dict[str, Any]] = None
+
+
+def _sanitize_voice_name(name: str) -> str:
+    """Sanitize voice name for filesystem safety.
+
+    Allows only alphanumeric, underscore, hyphen, and space characters.
+    Returns sanitized name or raises HTTPException if result is empty.
+    """
+    # Remove any path separators and dangerous characters
+    sanitized = re.sub(r'[^a-zA-Z0-9_\- ]', '', name)
+    sanitized = sanitized.strip()[:100]
+    if not sanitized:
+        raise HTTPException(status_code=400, detail="Invalid voice name: must contain alphanumeric characters")
+    return sanitized
+
+
+def _validate_audio_header(data: bytes) -> str:
+    """Validate audio file header, return detected format.
+
+    Only allows WAV and MP3 formats. Raises HTTPException for unsupported formats.
+    """
+    if len(data) < 12:
+        raise HTTPException(status_code=400, detail="Audio data too short to validate")
+
+    # WAV: starts with RIFF....WAVE
+    if data[:4] == b'RIFF' and data[8:12] == b'WAVE':
+        return 'wav'
+
+    # MP3: ID3 tag or frame sync
+    if data[:3] == b'ID3':
+        return 'mp3'
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        return 'mp3'
+
+    raise HTTPException(status_code=400, detail="Unsupported audio format: only WAV and MP3 are allowed")
+
+
+# Inworld gRPC-style error codes
+INWORLD_ERROR_INVALID_ARGUMENT = 3
+INWORLD_ERROR_NOT_FOUND = 5
+INWORLD_ERROR_INTERNAL = 13
+
+
+def _inworld_error_response(code: int, message: str, http_status: int = 400) -> JSONResponse:
+    """Return Inworld-compatible error response for non-streaming endpoints."""
+    return JSONResponse(
+        status_code=http_status,
+        content={"code": code, "message": message, "details": []},
+    )
+
+
+def _inworld_stream_error_response(code: int, message: str, http_status: int = 400) -> JSONResponse:
+    """Return Inworld-compatible error response for streaming endpoints."""
+    return JSONResponse(
+        status_code=http_status,
+        content={"error": {"code": code, "message": message, "details": []}},
+    )
+
+
 def _run_startup_tasks() -> None:
     _load_components()
     if VAD_REROLL_ENABLED:
@@ -2143,6 +2239,434 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
         media_type=media_type,
         headers={"X-Audio-Sample-Rate": str(SAMPLE_RATE)},
     )
+
+
+# ============================================================================
+# Inworld TTS API Compatibility Endpoints
+# ============================================================================
+
+
+@app.get("/tts/v1/voices")
+def inworld_list_voices(filter: Optional[str] = None):
+    """Inworld-compatible list voices endpoint.
+
+    Returns all available voices (built-in and cloned).
+    Supports optional filter parameter (e.g., filter=language=en).
+    """
+    if not INWORLD_COMPAT_ENABLED:
+        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Inworld compatibility endpoints are disabled", 404)
+
+    # Parse filter if provided (currently only language filter is supported)
+    language_filter = None
+    if filter:
+        if filter.startswith("language="):
+            language_filter = filter.split("=", 1)[1].lower()
+
+    voices = []
+
+    # Collect all voice files from VOICE_DIRS
+    seen_voices = set()
+    for voice_dir in VOICE_DIRS:
+        if not voice_dir.exists():
+            continue
+        for ext in _AUDIO_EXTS:
+            for voice_path in voice_dir.glob(f"*{ext}"):
+                voice_name = voice_path.stem
+                if voice_name in seen_voices:
+                    continue
+                seen_voices.add(voice_name)
+
+                # Determine if this is a cloned voice (has __ separator)
+                is_cloned = INWORLD_CLONE_SEPARATOR in voice_name
+
+                # Apply language filter (we assume all voices are English for now)
+                if language_filter and language_filter != "en":
+                    continue
+
+                voices.append({
+                    "languages": ["en"],
+                    "voiceId": voice_name,
+                    "displayName": voice_name.split(INWORLD_CLONE_SEPARATOR)[-1] if is_cloned else voice_name,
+                    "description": f"{'Cloned' if is_cloned else 'Built-in'} voice",
+                    "tags": ["cloned"] if is_cloned else ["built-in"],
+                })
+
+    # Also include folders if folder support is enabled
+    if FOLDER_SUPPORT:
+        for voice_dir in VOICE_DIRS:
+            if not voice_dir.exists():
+                continue
+            for item in voice_dir.iterdir():
+                if item.is_dir() and item.name not in seen_voices:
+                    seen_voices.add(item.name)
+                    is_cloned = INWORLD_CLONE_SEPARATOR in item.name
+
+                    if language_filter and language_filter != "en":
+                        continue
+
+                    voices.append({
+                        "languages": ["en"],
+                        "voiceId": item.name,
+                        "displayName": item.name.split(INWORLD_CLONE_SEPARATOR)[-1] if is_cloned else item.name,
+                        "description": f"{'Cloned' if is_cloned else 'Built-in'} voice folder",
+                        "tags": ["cloned", "folder"] if is_cloned else ["built-in", "folder"],
+                    })
+
+    return {"voices": voices}
+
+
+@app.post("/tts/v1/voice")
+def inworld_synthesize(payload: InworldSynthesizeRequest):
+    """Inworld-compatible speech synthesis endpoint.
+
+    Accepts Inworld TTS API format and returns base64-encoded audio.
+    """
+    if not INWORLD_COMPAT_ENABLED:
+        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Inworld compatibility endpoints are disabled", 404)
+
+    # Map audioEncoding to response_format
+    audio_encoding = "MP3"
+    if payload.audioConfig is not None and payload.audioConfig.audioEncoding:
+        audio_encoding = payload.audioConfig.audioEncoding.upper()
+
+    if audio_encoding == "LINEAR16":
+        response_format = "wav"
+    elif audio_encoding == "MP3":
+        response_format = "mp3"
+    else:
+        return _inworld_error_response(
+            INWORLD_ERROR_INVALID_ARGUMENT,
+            f"Unsupported audioEncoding '{audio_encoding}'. Only LINEAR16 and MP3 are supported."
+        )
+
+    # Check MP3 availability
+    if response_format == "mp3" and not FFMPEG_PATH:
+        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, "MP3 encoding requires ffmpeg in PATH")
+
+    # Get speaker latent - voiceId is used directly (includes workspace prefix for cloned voices)
+    voice_id = payload.voiceId
+
+    # Check if voice exists - don't fall through to base64 detection
+    voice_path = _find_voice_file(voice_id)
+    if not voice_path:
+        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, f"Voice '{voice_id}' not found", 404)
+
+    try:
+        speaker_latent, speaker_mask = _get_speaker_latent(voice_id)
+    except Exception as exc:
+        return _inworld_error_response(INWORLD_ERROR_INTERNAL, f"Failed to load voice '{voice_id}': {exc}", 500)
+
+    # Use streaming generation internally (has early stop benefits) but return all at once
+    sampler_cfg = _parse_sampler_config({})
+    seed = random.randint(0, 2**31 - 1)
+
+    # Collect all PCM chunks from streaming generation
+    pcm_chunks = []
+    for pcm_chunk in _stream_blocks(
+        text=payload.text,
+        speaker_latent=speaker_latent,
+        speaker_mask=speaker_mask,
+        cfg=sampler_cfg,
+        rng_seed=seed,
+    ):
+        pcm_chunks.append(pcm_chunk)
+
+    pcm_bytes = b"".join(pcm_chunks)
+
+    # Convert to requested format
+    if response_format == "wav":
+        audio_bytes = _pcm16_to_wav_bytes(pcm_bytes, SAMPLE_RATE)
+    else:  # mp3
+        audio_bytes = _encode_mp3_from_pcm(pcm_bytes, SAMPLE_RATE)
+
+    # Base64 encode
+    audio_content = base64.b64encode(audio_bytes).decode("utf-8")
+
+    # Return Inworld-compatible response with empty timestamp arrays
+    return {
+        "audioContent": audio_content,
+        "timestampInfo": {
+            "wordAlignment": {
+                "words": [],
+                "wordStartTimeSeconds": [],
+                "wordEndTimeSeconds": [],
+            },
+            "characterAlignment": {
+                "characters": [],
+                "characterStartTimeSeconds": [],
+                "characterEndTimeSeconds": [],
+            },
+        },
+    }
+
+
+@app.post("/tts/v1/voice:stream")
+def inworld_synthesize_stream(request: Request, payload: InworldSynthesizeRequest):
+    """Inworld-compatible streaming speech synthesis endpoint.
+
+    Streams audio chunks as JSON objects with base64-encoded audio.
+    Each chunk for LINEAR16 contains a complete WAV header.
+    """
+    if not INWORLD_COMPAT_ENABLED:
+        return _inworld_stream_error_response(INWORLD_ERROR_NOT_FOUND, "Inworld compatibility endpoints are disabled", 404)
+
+    # Map audioEncoding to response_format
+    audio_encoding = "MP3"
+    if payload.audioConfig is not None and payload.audioConfig.audioEncoding:
+        audio_encoding = payload.audioConfig.audioEncoding.upper()
+
+    if audio_encoding == "LINEAR16":
+        response_format = "wav"
+    elif audio_encoding == "MP3":
+        response_format = "mp3"
+    else:
+        return _inworld_stream_error_response(
+            INWORLD_ERROR_INVALID_ARGUMENT,
+            f"Unsupported audioEncoding '{audio_encoding}'. Only LINEAR16 and MP3 are supported."
+        )
+
+    # Check MP3 availability
+    if response_format == "mp3" and not FFMPEG_PATH:
+        return _inworld_stream_error_response(INWORLD_ERROR_INVALID_ARGUMENT, "MP3 encoding requires ffmpeg in PATH")
+
+    # Get speaker latent - voiceId is used directly (includes workspace prefix for cloned voices)
+    voice_id = payload.voiceId
+
+    # Check if voice exists - don't fall through to base64 detection
+    voice_path = _find_voice_file(voice_id)
+    if not voice_path:
+        return _inworld_stream_error_response(INWORLD_ERROR_NOT_FOUND, f"Voice '{voice_id}' not found", 404)
+
+    try:
+        speaker_latent, speaker_mask = _get_speaker_latent(voice_id)
+    except Exception as exc:
+        return _inworld_stream_error_response(INWORLD_ERROR_INTERNAL, f"Failed to load voice '{voice_id}': {exc}", 500)
+
+    # Use streaming sampler config
+    sampler_cfg = _parse_sampler_config({})
+    seed = random.randint(0, 2**31 - 1)
+
+    def generate_chunks() -> Iterator[bytes]:
+        """Generate JSON chunks with base64-encoded audio."""
+        for pcm_chunk in _stream_blocks(
+            text=payload.text,
+            speaker_latent=speaker_latent,
+            speaker_mask=speaker_mask,
+            cfg=sampler_cfg,
+            rng_seed=seed,
+        ):
+            # Convert PCM to requested format
+            if response_format == "wav":
+                # Each chunk gets its own WAV header for independent playback
+                audio_bytes = _pcm16_to_wav_bytes(pcm_chunk, SAMPLE_RATE)
+            else:  # mp3
+                audio_bytes = _encode_mp3_from_pcm(pcm_chunk, SAMPLE_RATE)
+
+            # Create Inworld-compatible JSON chunk
+            chunk_response = {
+                "result": {
+                    "audioContent": base64.b64encode(audio_bytes).decode("utf-8"),
+                    "timestampInfo": {
+                        "wordAlignment": {
+                            "words": [],
+                            "wordStartTimeSeconds": [],
+                            "wordEndTimeSeconds": [],
+                        },
+                        "characterAlignment": {
+                            "characters": [],
+                            "characterStartTimeSeconds": [],
+                            "characterEndTimeSeconds": [],
+                        },
+                    },
+                }
+            }
+            yield json.dumps(chunk_response).encode("utf-8") + b"\n"
+
+    return StreamingResponse(
+        generate_chunks(),
+        media_type="application/json",
+        headers={"X-Audio-Sample-Rate": str(SAMPLE_RATE)},
+    )
+
+
+@app.post("/voices/v1/workspaces/{workspace}/voices:clone")
+def inworld_clone_voice(workspace: str, payload: InworldCloneRequest):
+    """Inworld-compatible voice cloning endpoint.
+
+    Saves uploaded voice samples with Inworld format: {workspace}__{voice}
+    """
+    if not INWORLD_CLONE_ENABLED:
+        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Voice cloning is disabled. Set ECHO_INWORLD_CLONE_ENABLED=1 to enable.", 404)
+
+    # Sanitize workspace and display name
+    try:
+        sanitized_workspace = _sanitize_voice_name(workspace)
+        sanitized_name = _sanitize_voice_name(payload.displayName)
+    except HTTPException as exc:
+        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, exc.detail)
+
+    # Inworld format: {workspace}__{voice}
+    voice_id = f"{sanitized_workspace}{INWORLD_CLONE_SEPARATOR}{sanitized_name}"
+
+    # Check if voice already exists (check both .wav and .mp3)
+    if _find_voice_file(voice_id):
+        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, f"Voice '{voice_id}' already exists")
+
+    if not payload.voiceSamples:
+        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, "At least one voice sample is required")
+
+    # Process the first voice sample (we only support single sample for now)
+    sample = payload.voiceSamples[0]
+
+    # Decode base64 audio
+    try:
+        # Strip data URL prefix if present
+        audio_data_str = sample.audioData
+        if "," in audio_data_str and audio_data_str.startswith("data:"):
+            audio_data_str = audio_data_str.split(",", 1)[1]
+        audio_data = base64.b64decode(audio_data_str, validate=True)
+    except Exception as exc:
+        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, f"Invalid base64 audio data: {exc}")
+
+    # Check file size
+    if len(audio_data) > INWORLD_MAX_SAMPLE_SIZE:
+        return _inworld_error_response(
+            INWORLD_ERROR_INVALID_ARGUMENT,
+            f"Voice sample exceeds maximum size of {INWORLD_MAX_SAMPLE_SIZE // (1024*1024)} MB"
+        )
+
+    # Validate audio format
+    try:
+        audio_format = _validate_audio_header(audio_data)
+    except HTTPException as exc:
+        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, exc.detail)
+
+    # Save to audio_prompts directory
+    file_extension = audio_format
+    voice_path = VOICE_DIRS[0] / f"{voice_id}.{file_extension}"
+
+    try:
+        # Ensure directory exists
+        voice_path.parent.mkdir(parents=True, exist_ok=True)
+        voice_path.write_bytes(audio_data)
+    except Exception as exc:
+        return _inworld_error_response(INWORLD_ERROR_INTERNAL, f"Failed to save voice file: {exc}", 500)
+
+    _log_debug(f"[inworld] Created cloned voice: {voice_id} at {voice_path}")
+
+    # Return Inworld-compatible response
+    # voiceId is Inworld format: {workspace}__{voice}
+    return {
+        "voice": {
+            "name": f"workspaces/{sanitized_workspace}/voices/{sanitized_name}",
+            "voiceId": voice_id,  # Full format: {workspace}__{voice}
+            "displayName": payload.displayName,
+            "langCode": payload.langCode,
+            "description": payload.description or "",
+            "tags": payload.tags or [],
+        },
+        "audioSamplesValidated": [
+            {
+                "langCode": payload.langCode,
+                "warnings": [],
+                "errors": [],
+                "transcription": sample.transcription or "",
+            }
+        ],
+    }
+
+
+@app.get("/voices/v1/workspaces/{workspace}/voices/{voice}")
+def inworld_get_voice(workspace: str, voice: str):
+    """Inworld-compatible get voice endpoint.
+
+    Returns voice metadata. Works for both cloned and built-in voices.
+    """
+    if not INWORLD_COMPAT_ENABLED:
+        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Inworld compatibility endpoints are disabled", 404)
+
+    # Sanitize workspace and voice name
+    try:
+        sanitized_workspace = _sanitize_voice_name(workspace)
+        sanitized_voice = _sanitize_voice_name(voice)
+    except HTTPException as exc:
+        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, exc.detail)
+
+    # Try to find the voice - Inworld format first ({workspace}__{voice}), then plain
+    inworld_voice_id = f"{sanitized_workspace}{INWORLD_CLONE_SEPARATOR}{sanitized_voice}"
+    voice_path = _find_voice_file(inworld_voice_id)
+    is_cloned = voice_path is not None
+
+    if not is_cloned:
+        voice_path = _find_voice_file(sanitized_voice)
+
+    if voice_path is None:
+        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, f"Voice '{voice}' not found", 404)
+
+    # Return Inworld-compatible voice metadata
+    effective_voice_id = inworld_voice_id if is_cloned else sanitized_voice
+    return {
+        "name": f"workspaces/{sanitized_workspace}/voices/{sanitized_voice}",
+        "voiceId": effective_voice_id,
+        "displayName": sanitized_voice,
+        "langCode": "EN_US",
+        "description": f"{'Cloned' if is_cloned else 'Built-in'} voice: {sanitized_voice}",
+        "tags": ["cloned"] if is_cloned else ["built-in"],
+    }
+
+
+@app.delete("/voices/v1/workspaces/{workspace}/voices/{voice}")
+def inworld_delete_voice(workspace: str, voice: str, etag: Optional[str] = None):
+    """Inworld-compatible voice deletion endpoint.
+
+    Only allows deletion of cloned voices (those with {workspace}__ prefix).
+    """
+    if not INWORLD_CLONE_ENABLED:
+        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Voice management is disabled. Set ECHO_INWORLD_CLONE_ENABLED=1 to enable.", 404)
+
+    # Sanitize to prevent path traversal
+    try:
+        sanitized_workspace = _sanitize_voice_name(workspace)
+        sanitized_voice = _sanitize_voice_name(voice)
+    except HTTPException as exc:
+        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, exc.detail)
+
+    # Inworld format: {workspace}__{voice} - only these can be deleted
+    inworld_voice_id = f"{sanitized_workspace}{INWORLD_CLONE_SEPARATOR}{sanitized_voice}"
+
+    # Find and delete the voice file
+    deleted = False
+    for voice_dir in VOICE_DIRS:
+        for ext in [".wav", ".mp3"]:
+            voice_path = voice_dir / f"{inworld_voice_id}{ext}"
+            if voice_path.exists():
+                # Extra safety: verify path is within allowed directories
+                if not _is_path_within_voice_dirs(voice_path, _voice_roots()):
+                    return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, "Access denied", 403)
+                try:
+                    voice_path.unlink()
+                    deleted = True
+                    _log_debug(f"[inworld] Deleted voice: {inworld_voice_id} at {voice_path}")
+
+                    # Clear from speaker cache
+                    cache_key = f"file:{voice_path.resolve()}"
+                    if cache_key in _SPEAKER_CACHE:
+                        del _SPEAKER_CACHE[cache_key]
+                    # Also try to clear from GPU cache if enabled
+                    if CACHE_SPEAKER_ON_GPU:
+                        for device_cache in _SPEAKER_CACHE_GPU.values():
+                            if cache_key in device_cache:
+                                del device_cache[cache_key]
+                    break
+                except Exception as exc:
+                    return _inworld_error_response(INWORLD_ERROR_INTERNAL, f"Failed to delete voice: {exc}", 500)
+        if deleted:
+            break
+
+    if not deleted:
+        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, f"Voice '{voice}' not found", 404)
+
+    return {}
 
 
 if __name__ == "__main__":

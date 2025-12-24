@@ -104,6 +104,109 @@ Recommended settings for game voice AI applications (e.g., Mantella, xVASynth re
   - `ECHO_VAD_REROLL_ENABLED=1`: Automatically regenerates blocks with excessive silence, reducing the chance of awkward pauses in dialogue.
   - `stream: true` + `response_format: wav`: Benefits from early stop (model stops generating when speech ends, saving compute) while returning a standard WAV file compatible with game engines.
 
+#### SkyrimNet Integration
+For [SkyrimNet](https://github.com/MinLL/SkyrimNet-GamePlugin) users, Echo-TTS provides Inworld TTS API compatibility:
+
+1. **Start the server with voice cloning enabled**:
+   ```bash
+   ECHO_PERFORMANCE_PRESET=equal ECHO_VAD_REROLL_ENABLED=1 ECHO_COMPILE_AE=1 ECHO_INWORLD_CLONE_ENABLED=1 python api_server.py
+   ```
+
+2. **Configure SkyrimNet**:
+   - In SkyrimNet settings, set the TTS API URL to your Echo-TTS server: `http://<your-ip>:8000`
+   - Select "Inworld TTS" as the TTS provider
+
+3. **Voice cloning**: SkyrimNet can clone character voices via the `/voices/v1/workspaces/{workspace}/voices:clone` endpoint. Cloned voices are saved with the format `{workspace}__{voice}` (e.g., `default__Lydia.wav`).
+
+### Inworld TTS API Compatibility
+
+Echo-TTS includes Inworld TTS API-compatible endpoints for drop-in replacement with tools like Mantella. These endpoints are **enabled by default**.
+
+#### Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /tts/v1/voices` | List all available voices |
+| `POST /tts/v1/voice` | Synthesize speech (non-streaming, returns complete audio) |
+| `POST /tts/v1/voice:stream` | Synthesize speech (streaming JSON chunks with base64 audio) |
+| `GET /voices/v1/workspaces/{workspace}/voices/{voice}` | Get voice metadata |
+| `POST /voices/v1/workspaces/{workspace}/voices:clone` | Clone a voice from audio sample (disabled by default) |
+| `DELETE /voices/v1/workspaces/{workspace}/voices/{voice}` | Delete a cloned voice (disabled by default) |
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ECHO_INWORLD_COMPAT` | `1` | Enable Inworld-compatible endpoints |
+| `ECHO_INWORLD_CLONE_ENABLED` | `0` | Enable voice cloning/deletion (security-sensitive) |
+| `ECHO_INWORLD_MAX_SAMPLE_SIZE` | `104857600` | Max voice sample size in bytes (100 MB) |
+
+#### Example: List Voices
+```bash
+curl http://localhost:8000/tts/v1/voices
+```
+
+Response:
+```json
+{
+  "voices": [
+    {"languages": ["en"], "voiceId": "expresso_02_ex03-ex01_calm_005", "displayName": "expresso_02_ex03-ex01_calm_005", "description": "Built-in voice", "tags": ["built-in"]},
+    {"languages": ["en"], "voiceId": "default__John", "displayName": "John", "description": "Cloned voice", "tags": ["cloned"]}
+  ]
+}
+```
+
+#### Example: Synthesize Speech
+```bash
+curl -X POST http://localhost:8000/tts/v1/voice \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello, this is a test.",
+    "voiceId": "expresso_02_ex03-ex01_calm_005",
+    "modelId": "inworld-tts-1",
+    "audioConfig": {"audioEncoding": "LINEAR16"}
+  }'
+```
+
+Response:
+```json
+{
+  "audioContent": "<base64-encoded WAV>",
+  "timestampInfo": {"wordAlignment": {...}, "characterAlignment": {...}}
+}
+```
+
+#### Example: Get Voice Metadata
+```bash
+curl http://localhost:8000/voices/v1/workspaces/default/voices/expresso_02_ex03-ex01_calm_005
+```
+
+Response:
+```json
+{
+  "name": "workspaces/default/voices/expresso_02_ex03-ex01_calm_005",
+  "voiceId": "expresso_02_ex03-ex01_calm_005",
+  "displayName": "expresso_02_ex03-ex01_calm_005",
+  "langCode": "EN_US",
+  "description": "Built-in voice: expresso_02_ex03-ex01_calm_005",
+  "tags": ["built-in"]
+}
+```
+
+#### Audio Format Support
+- `LINEAR16` → WAV (16-bit PCM with header)
+- `MP3` → MP3 (requires ffmpeg)
+- Other formats return 400 error
+
+#### Voice Cloning Security
+Voice cloning is **disabled by default** (`ECHO_INWORLD_CLONE_ENABLED=0`). When enabled:
+- Voice names are sanitized (alphanumeric, underscore, hyphen, space only)
+- Only WAV and MP3 uploads are accepted (validated by file header)
+- Maximum upload size: 100 MB
+- Cloned voices use Inworld format: `{workspace}__{voice}` (e.g., `default__John`)
+- Only voices with this format can be deleted through the API
+- Original/manually-added voices cannot be deleted through the API
+
 # Original README
 
 A multi-speaker text-to-speech model with speaker reference conditioning. See the [blog post](https://jordandarefsky.com/blog/2025/echo/) for technical details.
