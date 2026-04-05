@@ -91,10 +91,11 @@ VAD_REROLL_ENABLED = os.getenv("ECHO_VAD_REROLL_ENABLED", "0") == "1"
 VAD_MAX_REROLLS = int(os.getenv("ECHO_VAD_MAX_REROLLS", "3"))
 VAD_SILENCE_THRESHOLD_MS = int(os.getenv("ECHO_VAD_SILENCE_THRESHOLD_MS", "1000"))
 # Inworld TTS compatibility settings
-INWORLD_COMPAT_ENABLED = os.getenv("ECHO_INWORLD_COMPAT", "1") == "1"
+INWORLD_COMPAT_ENABLED = os.getenv("ECHO_INWORLD_COMPAT", "0") == "1"
 INWORLD_CLONE_ENABLED = os.getenv("ECHO_INWORLD_CLONE_ENABLED", "0") == "1"
 INWORLD_CLONE_SEPARATOR = "__"  # Inworld format: {workspace}__{voice}
 INWORLD_MAX_SAMPLE_SIZE = int(os.getenv("ECHO_INWORLD_MAX_SAMPLE_SIZE", str(100 * 1024 * 1024)))  # 100 MB
+INWORLD_DEFAULT_WORKSPACE = os.getenv("ECHO_INWORLD_DEFAULT_WORKSPACE", "default")
 # Performance presets
 _PERFORMANCE_PRESET_RAW = os.getenv("ECHO_PERFORMANCE_PRESET", "default")
 PERFORMANCE_PRESET = _PERFORMANCE_PRESET_RAW.strip().lower().replace("-", "_")
@@ -2667,6 +2668,128 @@ def inworld_delete_voice(workspace: str, voice: str, etag: Optional[str] = None)
         return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, f"Voice '{voice}' not found", 404)
 
     return {}
+
+
+# ============================================================================
+# Inworld TTS API v2 Endpoints (flat URLs, no workspace in path)
+#
+# Inworld simplified their API paths — /workspaces/{workspace} is no longer
+# required. When omitted, the workspace is derived from the API key.
+# The old /voices/v1/workspaces/{workspace}/... endpoints above remain
+# supported for backwards compatibility.
+# ============================================================================
+
+
+@app.get("/voices/v1/voices")
+def inworld_list_voices_v2(filter: Optional[str] = None):
+    """New-style Inworld list voices (no workspace in URL).
+
+    Returns richer voice objects with langCode, name (resource name),
+    and full voiceId. Replaces the old GET /tts/v1/voices endpoint.
+    """
+    if not INWORLD_COMPAT_ENABLED:
+        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Inworld compatibility endpoints are disabled", 404)
+
+    # Parse filter if provided
+    language_filter = None
+    if filter:
+        if filter.startswith("language="):
+            language_filter = filter.split("=", 1)[1].lower()
+
+    voices = []
+    seen_voices = set()
+
+    for voice_dir in VOICE_DIRS:
+        if not voice_dir.exists():
+            continue
+        for ext in _AUDIO_EXTS:
+            for voice_path in voice_dir.glob(f"*{ext}"):
+                voice_name = voice_path.stem
+                if voice_name in seen_voices:
+                    continue
+                seen_voices.add(voice_name)
+
+                is_cloned = INWORLD_CLONE_SEPARATOR in voice_name
+
+                if language_filter and language_filter != "en":
+                    continue
+
+                # Derive workspace and display name from voiceId
+                if is_cloned:
+                    workspace_part, display_part = voice_name.split(INWORLD_CLONE_SEPARATOR, 1)
+                else:
+                    workspace_part = INWORLD_DEFAULT_WORKSPACE
+                    display_part = voice_name
+
+                voices.append({
+                    "voiceId": voice_name,
+                    "displayName": display_part,
+                    "langCode": "EN_US",
+                    "name": f"workspaces/{workspace_part}/voices/{display_part}",
+                    "description": f"{'Cloned' if is_cloned else 'Built-in'} voice",
+                    "tags": ["cloned"] if is_cloned else ["built-in"],
+                })
+
+    # Also include folders if folder support is enabled
+    if FOLDER_SUPPORT:
+        for voice_dir in VOICE_DIRS:
+            if not voice_dir.exists():
+                continue
+            for item in voice_dir.iterdir():
+                if item.is_dir() and item.name not in seen_voices:
+                    seen_voices.add(item.name)
+                    is_cloned = INWORLD_CLONE_SEPARATOR in item.name
+
+                    if language_filter and language_filter != "en":
+                        continue
+
+                    if is_cloned:
+                        workspace_part, display_part = item.name.split(INWORLD_CLONE_SEPARATOR, 1)
+                    else:
+                        workspace_part = INWORLD_DEFAULT_WORKSPACE
+                        display_part = item.name
+
+                    voices.append({
+                        "voiceId": item.name,
+                        "displayName": display_part,
+                        "langCode": "EN_US",
+                        "name": f"workspaces/{workspace_part}/voices/{display_part}",
+                        "description": f"{'Cloned' if is_cloned else 'Built-in'} voice folder",
+                        "tags": ["cloned", "folder"] if is_cloned else ["built-in", "folder"],
+                    })
+
+    return {"voices": voices}
+
+
+@app.post("/voices/v1/voices:clone")
+def inworld_clone_voice_v2(payload: InworldCloneRequest):
+    """New-style Inworld voice cloning (no workspace in URL).
+
+    Workspace is derived internally (uses ECHO_INWORLD_DEFAULT_WORKSPACE).
+    """
+    return inworld_clone_voice(INWORLD_DEFAULT_WORKSPACE, payload)
+
+
+@app.get("/voices/v1/voices/{voice_id}")
+def inworld_get_voice_v2(voice_id: str):
+    """New-style Inworld get voice (full voiceId in URL)."""
+    if INWORLD_CLONE_SEPARATOR in voice_id:
+        workspace, voice = voice_id.split(INWORLD_CLONE_SEPARATOR, 1)
+    else:
+        workspace = INWORLD_DEFAULT_WORKSPACE
+        voice = voice_id
+    return inworld_get_voice(workspace, voice)
+
+
+@app.delete("/voices/v1/voices/{voice_id}")
+def inworld_delete_voice_v2(voice_id: str, etag: Optional[str] = None):
+    """New-style Inworld voice deletion (full voiceId in URL)."""
+    if INWORLD_CLONE_SEPARATOR in voice_id:
+        workspace, voice = voice_id.split(INWORLD_CLONE_SEPARATOR, 1)
+    else:
+        workspace = INWORLD_DEFAULT_WORKSPACE
+        voice = voice_id
+    return inworld_delete_voice(workspace, voice, etag)
 
 
 if __name__ == "__main__":

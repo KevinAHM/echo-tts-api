@@ -137,9 +137,17 @@ Echo-TTS includes Inworld TTS API-compatible endpoints for drop-in replacement w
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ECHO_INWORLD_COMPAT` | `1` | Enable Inworld-compatible endpoints |
+| `ECHO_INWORLD_COMPAT` | `0` | Enable Inworld-compatible endpoints |
 | `ECHO_INWORLD_CLONE_ENABLED` | `0` | Enable voice cloning/deletion (security-sensitive) |
 | `ECHO_INWORLD_MAX_SAMPLE_SIZE` | `104857600` | Max voice sample size in bytes (100 MB) |
+| `ECHO_INWORLD_DEFAULT_WORKSPACE` | `default` | Default workspace for new-style flat API endpoints |
+
+Both the original and new Inworld API endpoint styles are supported. The new style removes `/workspaces/{workspace}` from the URL path (workspace is derived from the API key). Old-style endpoints remain available for backwards compatibility.
+
+| Style | List Voices | Clone | Delete | Get |
+|-------|-------------|-------|--------|-----|
+| Old | `GET /tts/v1/voices` | `POST /voices/v1/workspaces/{ws}/voices:clone` | `DELETE /voices/v1/workspaces/{ws}/voices/{voice}` | `GET /voices/v1/workspaces/{ws}/voices/{voice}` |
+| New | `GET /voices/v1/voices` | `POST /voices/v1/voices:clone` | `DELETE /voices/v1/voices/{voiceId}` | `GET /voices/v1/voices/{voiceId}` |
 
 #### Example: List Voices
 ```bash
